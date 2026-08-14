@@ -1,5 +1,12 @@
 *.pyc
+__pycache__/
 pyglet/
 future/
 past/
 libfuturize/
+build/
+*.egg-info/
+*.so
+*.pyd
+*.dll
+bwcore.*.so

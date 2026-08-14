@@ -1,6 +1,6 @@
-[![Build status](https://github.com/brain-workshop/brainworkshop/actions/workflows/zip.yml/badge.svg?branch=master)](https://github.com/brain-workshop/brainworkshop/actions/workflows/zip.yml)
+[![Build status](https://github.com/torarinvik/neural-workshop/actions/workflows/zip.yml/badge.svg?branch=master)](https://github.com/torarinvik/neural-workshop/actions/workflows/zip.yml)
 
-# BrainWorkshop 5
+# Neural Workshop 5
 PS: If you appreciated this work, please star the repository. It helps others
 find this repository
 
@@ -15,7 +15,7 @@ stable compared to the original project and work with modern Python and Pyglet
 
 ## Downloads
 
- * Windows: https://github.com/brain-workshop/brainworkshop/releases
+ * Windows: https://github.com/torarinvik/neural-workshop/releases
 
 ## New in this release:
 
@@ -45,10 +45,36 @@ stable compared to the original project and work with modern Python and Pyglet
 ## Notes:
 * You need pyglet installed for this to work.
 
+### Native C kernels (recommended)
+
+The heaviest game loops (Jaeggi/BT sequence construction, session scoring,
+stats-file parsing, graph aggregation, variable n-back draws, and rounded-
+rectangle vertices) live in a C extension, `bwcore`.
+
+Build it once from the project root (needs a C compiler and Python headers):
+
+```
+python setup.py build_ext --inplace
+```
+
+The game still runs without the extension: `bwaccel.py` falls back to
+equivalent Python. Sessions at high n-back are much faster with the C module,
+because the old rejection sampler is replaced by an O(n) constructive
+generator that still produces exactly 6 position matches, 6 audio matches,
+and 2 dual matches.
+
+The title screen and the workshop hub show a tiny `native: C` or
+`native: Python` tag so you can see which path is live. Launch with
+`--debug` to print the same tag on the console.
+
+Windows release zips are frozen with `bwcore` already compiled in — players
+do not need a C compiler. CI also publishes platform wheels as artifacts
+(and attaches them to tagged releases).
+
 ### Python 3
 If you are having issues launching BrainWorkshop even if you have `pyglet`, `future`, `past` and
   `libfuturize` modules installed, follow these steps first:
-1. Copy the following folders into the brainworkshop folder: past, future and
+1. Copy the following folders into the neural-workshop folder: past, future and
    libfuturize. You can get those here: https://github.com/PythonCharmers/python-future
 2. Copy the pyglet module into a `pyglet` folder. You can get pyglet here: http://www.pyglet.org/
 

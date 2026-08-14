@@ -3,26 +3,102 @@ name: Release
 on: push
 
 jobs:
+  test:
+    name: Test native (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ['3.11']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache compiled bwcore
+        uses: actions/cache@v4
+        with:
+          path: |
+            build
+            bwcore*.so
+            bwcore*.pyd
+          key: bwcore-${{ runner.os }}-py${{ matrix.python-version }}-${{ hashFiles('native/bwcore.c', 'setup.py') }}
+
+      - name: Build native module
+        run: python setup.py build_ext --inplace
+
+      - name: Test kernels
+        run: python tests/test_bwcore.py
+
+      - name: Require C backend
+        run: python -c "import bwaccel; assert bwaccel.backend()=='C', bwaccel.banner(); print(bwaccel.banner())"
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel -o wheels
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bwcore-wheel-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: wheels/*.whl
+
   win:
+    name: Windows freeze
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
       - uses: conda-incubator/setup-miniconda@v3
         with:
           miniforge-version: latest
+          auto-activate-base: true
+
+      - name: Cache compiled bwcore
+        uses: actions/cache@v4
+        with:
+          path: |
+            build
+            bwcore*.so
+            bwcore*.pyd
+          key: bwcore-win-conda-${{ hashFiles('native/bwcore.c', 'setup.py') }}
+
       - name: Install
         run: |
           conda install -y pyglet cx_freeze ffmpeg
           conda list
           cxfreeze --version
+
       - name: Build
         run: |
           .\tools\freeze.bat
           xcopy C:\Miniconda3\envs\test\Library\bin\*.dll dist /y
           xcopy C:\Miniconda3\envs\test\Library\bin\ffmpeg.exe dist
           7z a brainworkshop.zip dist\*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: brainworkshop-windows-zip
+          path: brainworkshop.zip
+
+  release:
+    name: Attach release assets
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [test, win]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
       - name: Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/')
         with:
-          files: brainworkshop.zip
+          files: artifacts/**/*

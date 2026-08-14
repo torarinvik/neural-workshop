@@ -4,7 +4,7 @@
 #
 # This is a fork of the popular Brain Workshop game. Development on the original
 # has not happened for many years. The fork is available at:
-# https://github.com/brain-workshop/brainworkshop
+# https://github.com/torarinvik/neural-workshop
 #
 # Tutorial, installation instructions & links to the dual n-back community
 # are available at the original Brain Workshop web site:
@@ -54,12 +54,14 @@ import random, os, sys, socket, webbrowser, time, math, traceback, datetime, err
 import urllib.request, configparser as ConfigParser
 from io import StringIO
 import pickle
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from time import strftime
 from datetime import date
 import gettext
 from pyglet.shapes import Line
 from pyglet.shapes import Polygon
+
+import bwaccel
 
 # TODO check if this is right
 gettext.install('messages', localedir='res/i18n')
@@ -318,6 +320,12 @@ CROSSHAIRS = True
 # 5 = magenta, 6 = red, 7 = white, 8 = yellow
 # Default: [1, 3, 8, 6]
 VISUAL_COLORS = [1, 3, 8, 6]
+
+# Position N-Back curriculum: number of publicly visible grid cells sampled.
+# Cells are introduced center-out in the order left/right, up/down, corners.
+# This changes only the human-visible stimulus distribution; scoring and rules
+# remain ordinary Position N-Back.
+POSITION_CELL_COUNT = int(os.environ.get('BRAINWORKSHOP_POSITION_CELLS', '8'))
 
 # Specify image sets here. This is a list of subfolders in the res/sprites/
 # folder which may be selected in Image mode.
@@ -642,6 +650,7 @@ def dump_pyglet_info():
 # parse config file & command line options
 if '--debug' in sys.argv:
     DEBUG = True
+    debug_msg(bwaccel.banner())
 if '--vsync' in sys.argv or sys.platform == 'darwin':
     VSYNC = True
 if '--dump' in sys.argv:
@@ -816,6 +825,19 @@ except OSError as e:
 load_last_user('defaults.ini')
 
 cfg = parse_config(CONFIGFILE)
+
+trial_count_override = os.environ.get('BRAINWORKSHOP_TRIALS')
+if trial_count_override is not None:
+    trial_count_override = int(trial_count_override)
+    if trial_count_override < 1:
+        raise ValueError('BRAINWORKSHOP_TRIALS must be positive')
+    # Make the requested session length exact at every n-back level.
+    cfg.NUM_TRIALS = trial_count_override
+    cfg.NUM_TRIALS_FACTOR = 0
+
+if os.environ.get('BRAINWORKSHOP_MUTE_MUSIC', '').lower() in (
+        '1', 'true', 'yes', 'on'):
+    cfg.USE_MUSIC = False
 
 if CLINICAL_MODE:
     cfg.JAEGGI_INTERFACE_DEFAULT_SCORING = False
@@ -1437,70 +1459,44 @@ class Graph:
         if os.path.isfile(os.path.join(get_data_dir(), cfg.STATSFILE)):
             try:
                 statsfile_path = os.path.join(get_data_dir(), cfg.STATSFILE)
-                statsfile = open(statsfile_path, 'r')
-                for line in statsfile:
-                    if line == '': continue
-                    if line == '\n': continue
-                    if line[0] not in '0123456789': continue
-                    datestamp = date(int(line[:4]), int(line[5:7]), int(line[8:10]))
-                    hour = int(line[11:13])
-                    if hour < cfg.ROLLOVER_HOUR:
-                        datestamp = date.fromordinal(datestamp.toordinal() - 1)
-                    if line.find('\t') >= 0:
-                        separator = '\t'
-                    else: separator = ','
-                    newline = line.split(separator)
-                    try:
-                        if int(newline[7]) != 0: # only consider standard mode
-                            continue
-                    except:
+                with open(statsfile_path, 'r') as statsfile:
+                    records = bwaccel.parse_stats_text(statsfile.read())
+                for rec in records:
+                    if rec['manual'] != 0:  # only consider standard mode
                         continue
-                    newmode = int(newline[3])
-                    newback = int(newline[4])
-
-                    while len(newline) < 24:
-                        newline.append('0') # make it work for image mode, missing visaudio and audio2
-                    if len(newline) >= 16:
+                    datestamp = date(rec['year'], rec['month'], rec['day'])
+                    if rec['hour'] < cfg.ROLLOVER_HOUR:
+                        datestamp = date.fromordinal(datestamp.toordinal() - 1)
+                    newmode = rec['mode']
+                    newback = rec['nback']
+                    cats = list(rec['cats'])
+                    while len(cats) < 16:
+                        cats.append(0)
+                    # cats[0] is position1 (CSV column 9) — map via `ind`
+                    col = [None] * 25
+                    col[2] = rec['percent']
+                    for i, val in enumerate(cats):
+                        col[9 + i] = val
+                    if newmode in mode.modalities:
                         for m in mode.modalities[newmode]:
-                            self.percents[newmode][m].append(int(newline[ind[m]]))
-
-                    dictionary = self.dictionaries[newmode]
-                    if datestamp not in dictionary:
-                        dictionary[datestamp] = []
-                    dictionary[datestamp].append([newback] + [int(newline[2])] + \
-                        [self.percents[newmode][n][-1] for n in mode.modalities[newmode]])
-
-                statsfile.close()
+                            self.percents[newmode][m].append(int(col[ind[m]]))
+                        dictionary = self.dictionaries[newmode]
+                        if datestamp not in dictionary:
+                            dictionary[datestamp] = []
+                        dictionary[datestamp].append([newback] + [int(rec['percent'])] + \
+                            [self.percents[newmode][n][-1] for n in mode.modalities[newmode]])
             except:
                 quit_with_error(_('Error parsing stats file\n %s') %
                                 os.path.join(get_data_dir(), cfg.STATSFILE),
                                 _('Please fix, delete or rename the stats file.'))
 
-            def mean(x):
-                if len(x):
-                    return sum(x)/float(len(x))
-                else:
-                    return 0.
-            def cent(x):
-                return map(lambda y: .01*y, x)
-
+            adv, flb = get_threshold_advance(), get_threshold_fallback()
+            style = self.styles[self.style]
             for dictionary in self.dictionaries.values():
-                for datestamp in list(dictionary): # this would be so much easier with numpy
+                for datestamp in list(dictionary):
                     entries = dictionary[datestamp]
-                    if self.styles[self.style] == 'N':
-                        scores = [entry[0] for entry in entries]
-                    elif self.styles[self.style] == '%':
-                        scores = [.01*entry[1] for entry in entries]
-                    elif self.styles[self.style] == 'N.%':
-                        scores = [entry[0] + .01*entry[1] for entry in entries]
-                    elif self.styles[self.style] == 'N+2*%-1':
-                        scores = [entry[0] - 1 + 2*.01*entry[1] for entry in entries]
-                    elif self.styles[self.style] == 'N+10/3+4/3':
-                        adv, flb = get_threshold_advance(), get_threshold_fallback()
-                        m = 1./(adv - flb)
-                        b = -m*flb
-                        scores = [entry[0] + b + m*(entry[1]) for entry in entries]
-                    dictionary[datestamp] = (mean(scores), max(scores))
+                    dictionary[datestamp] = bwaccel.aggregate_day_scores(
+                        style, entries, adv, flb)
 
             for game in self.percents:
                 for category in self.percents[game]:
@@ -1508,7 +1504,8 @@ class Graph:
                     if not pcts:
                         self.percents[game][category].append(0)
                     else:
-                        self.percents[game][category].append(sum(pcts)/len(pcts))
+                        self.percents[game][category].append(
+                            bwaccel.mean_tail(pcts, 0))
 
     #def export_data(self):
         #dictionary = {}
@@ -2613,17 +2610,9 @@ class Visual:
                         lx, ty,)),
                         ('c4B', self.color * 4))
                 else:
-                    #rounded corners: bottom-left, bottom-right, top-right, top-left
-                    x = ([lx + int(cr*(1-math.cos(math.radians(i)))) for i in range(0, 91, 10)] +
-                         [rx - int(cr*(1-math.sin(math.radians(i)))) for i in range(0, 91, 10)] +
-                         [rx - int(cr*(1-math.sin(math.radians(i)))) for i in range(90, -1, -10)] +
-                         [lx + int(cr*(1-math.cos(math.radians(i)))) for i in range(90, -1, -10)])
-
-                    y = ([by + int(cr*(1-math.sin(math.radians(i)))) for i in range(0, 91, 10) + range(90, -1, -10)] +
-                         [ty - int(cr*(1-math.sin(math.radians(i)))) for i in range(0, 91, 10) + range(90, -1, -10)])
-                    xy = []
-                    for a,b in zip(x,y): xy.extend((a, b))
-
+                    # rounded corners: bottom-left, bottom-right, top-right, top-left
+                    # (C kernel; also fixes the Python 3 `range + range` TypeError)
+                    xy = bwaccel.rounded_rect_vertices(lx, rx, by, ty, cr)
                     self.square = batch.add(40, pyglet.gl.GL_POLYGON, None,
                                             ('v2i', xy), ('c4B', self.color * 40))
 
@@ -2844,6 +2833,9 @@ class GameModeLabel:
                 str_list.append(_('V. '))
             str_list.append(str(mode.back))
             str_list.append(_('-Back'))
+            if mode.mode == 10:
+                str_list.append(_(' (%i cells, %i trials)') %
+                                (cfg.POSITION_CELL_COUNT, mode.num_trials_total))
             self.label.text = ''.join(str_list)
 
     def flash(self):
@@ -2945,10 +2937,16 @@ class TitleMessageLabel:
             font_size=calc_fontsize(14), weight='normal', color = cfg.COLOR_TEXT,
             x = width_center(), y = from_top_edge(55),
             anchor_x = 'center', anchor_y = 'center')
+        self.native = pyglet.text.Label(
+            bwaccel.banner(),
+            font_size=calc_fontsize(10), weight='normal', color = cfg.COLOR_TEXT,
+            x = width_center(), y = from_top_edge(78),
+            anchor_x = 'center', anchor_y = 'center')
 
     def draw(self):
         self.label.draw()
         self.label2.draw()
+        self.native.draw()
 
 class TitleKeysLabel:
     def __init__(self):
@@ -2981,6 +2979,28 @@ class TitleKeysLabel:
     def draw(self):
         self.space.draw()
         self.keys.draw()
+
+
+class NativeBackendLabel:
+    """Tiny ``native: C`` / ``native: Python`` tag on the workshop hub."""
+
+    def __init__(self):
+        self.label = pyglet.text.Label(
+            '',
+            font_size=calc_fontsize(9),
+            color=cfg.COLOR_TEXT,
+            x=from_left_edge(10),
+            y=from_bottom_edge(14),
+            anchor_x='left',
+            anchor_y='center',
+            batch=batch)
+        self.update()
+
+    def update(self):
+        if CLINICAL_MODE or mode.started:
+            self.label.text = ''
+        else:
+            self.label.text = bwaccel.banner()
 
 
 # this is the word "brain" above the brain logo.
@@ -3302,6 +3322,9 @@ class SpaceLabel:
                 str_list.append(_('V. '))
             str_list.append(str(mode.back))
             str_list.append(_('-Back'))
+            if mode.mode == 10:
+                str_list.append(_(' (%i cells, %i trials)') %
+                                (cfg.POSITION_CELL_COUNT, mode.num_trials_total))
             self.label.text = ''.join(str_list)
 
 def check_match(input_type, check_missed = False):
@@ -3341,27 +3364,19 @@ def check_match(input_type, check_missed = False):
         back_data = input_type
 
     if input_type == 'arithmetic':
-        if operation == 'add':
-            correct_answer = back_data + current
-        elif operation == 'subtract':
-            correct_answer = back_data - current
-        elif operation == 'multiply':
-            correct_answer = back_data * current
-        elif operation == 'divide':
-            correct_answer = Decimal(back_data) / Decimal(current)
+        try:
+            correct_answer = bwaccel.apply_arithmetic(operation, back_data, current)
+        except (InvalidOperation, ZeroDivisionError, ValueError, TypeError):
+            return 'incorrect'
         if correct_answer == arithmeticAnswerLabel.parse_answer():
             return 'correct'
     else:
-        # Catch accesses past list end
-        try:
-            if current == stats.session[back_data][nback_trial]:
-                if check_missed:
-                    return 'missed'
-                else:
-                    return 'correct'
-        except Exception as e:
-            print(e)
+        matched = bwaccel.is_nback_match(
+            current, stats.session[back_data], nback_trial)
+        if matched is None:
             return 'incorrect'
+        if matched:
+            return 'missed' if check_missed else 'correct'
     return 'incorrect'
 
 
@@ -3393,37 +3408,27 @@ class AnalysisLabel:
         mods = mode.modalities[mode.mode]
         data = stats.session
 
+        scored = bwaccel.analyze_session(
+            mode.back,
+            bool(mode.flags[mode.mode]['crab']),
+            bool(cfg.JAEGGI_SCORING),
+            mode.variable_list if cfg.VARIABLE_NBACK else None,
+            mods,
+            data,
+        )
         for mod in mods:
-            for x in range(mode.back, len(data['position1'])):
-
-                if mode.flags[mode.mode]['crab'] == 1:
-                    back = 1 + 2*(x % mode.back)
-                else:
-                    back = mode.back
-                if cfg.VARIABLE_NBACK:
-                    back = mode.variable_list[x - back]
-
-                # data is a dictionary of lists.
-                if mod in ['position1', 'position2', 'position3', 'position4',
-                           'vis1', 'vis2', 'vis3', 'vis4', 'audio', 'audio2', 'color', 'image']:
-                    rights[mod] += int((data[mod][x] == data[mod][x-back]) and data[mod+'_input'][x])
-                    wrongs[mod] += int((data[mod][x] == data[mod][x-back])  ^  data[mod+'_input'][x]) # ^ is XOR
-                    if cfg.JAEGGI_SCORING:
-                        rights[mod] += int(data[mod][x] != data[mod][x-back]  and not data[mod+'_input'][x])
-
-                if mod in ['visvis', 'visaudio', 'audiovis']:
-                    modnow = mod.startswith('vis') and 'vis' or 'audio' # these are the python<2.5 compatible versions
-                    modthn = mod.endswith('vis')   and 'vis' or 'audio' # of 'vis' if mod.startswith('vis') else 'audio'
-                    rights[mod] += int((data[modnow][x] == data[modthn][x-back]) and data[mod+'_input'][x])
-                    wrongs[mod] += int((data[modnow][x] == data[modthn][x-back])  ^  data[mod+'_input'][x])
-                    if cfg.JAEGGI_SCORING:
-                        rights[mod] += int(data[modnow][x] != data[modthn][x-back]  and not data[mod+'_input'][x])
-
-                if mod in ['arithmetic']:
-                    ops = {'add':'+', 'subtract':'-', 'multiply':'*', 'divide':'/'}
-                    answer = eval("Decimal(data['numbers'][x-back]) %s Decimal(data['numbers'][x])" % ops[data['operation'][x]])
-                    rights[mod] += int(answer == Decimal(data[mod+'_input'][x])) # data[...][x] is only Decimal if op == /
-                    wrongs[mod] += int(answer != Decimal(data[mod+'_input'][x]))
+            pair = scored.get(mod)
+            if pair is not None:
+                rights[mod], wrongs[mod] = pair
+                continue
+            # Decimal arithmetic: no eval(), exact Decimal ops in bwaccel.
+            if mod == 'arithmetic':
+                rights[mod], wrongs[mod] = bwaccel.score_arithmetic(
+                    mode.back,
+                    bool(mode.flags[mode.mode]['crab']),
+                    mode.variable_list if cfg.VARIABLE_NBACK else None,
+                    data,
+                )
 
         str_list = []
         if not CLINICAL_MODE:
@@ -3768,46 +3773,33 @@ class Stats:
                 last_mode = 0
                 last_back = 0
                 statsfile_path = os.path.join(get_data_dir(), cfg.STATSFILE)
-                statsfile = open(statsfile_path, 'r')
-                is_today = False
-                is_thours = False
+                with open(statsfile_path, 'r') as statsfile:
+                    records = bwaccel.parse_stats_text(statsfile.read())
                 today = date.today()
                 yesterday = date.fromordinal(today.toordinal() - 1)
-                tomorrow = date.fromordinal(today.toordinal() + 1)
-                for line in statsfile:
-                    if line == '': continue
-                    if line == '\n': continue
-                    if line[0] not in '0123456789': continue
-                    datestamp = date(int(line[:4]), int(line[5:7]), int(line[8:10]))
-                    hour = int(line[11:13])
-                    mins = int(line[14:16])
-                    sec = int(line[17:19])
-                    thour = datetime.datetime.today().hour
-                    tmin = datetime.datetime.today().minute
-                    tsec = datetime.datetime.today().second
-                    if int(strftime('%H')) < cfg.ROLLOVER_HOUR:
+                now = datetime.datetime.today()
+                thour, tmin, tsec = now.hour, now.minute, now.second
+                hour_now = int(strftime('%H'))
+                for rec in records:
+                    datestamp = date(rec['year'], rec['month'], rec['day'])
+                    hour = rec['hour']
+                    mins = rec['minute']
+                    sec = rec['second']
+                    is_today = False
+                    is_thours = False
+                    if hour_now < cfg.ROLLOVER_HOUR:
                         if datestamp == today or (datestamp == yesterday and hour >= cfg.ROLLOVER_HOUR):
                             is_today = True
                     elif datestamp == today and hour >= cfg.ROLLOVER_HOUR:
                         is_today = True
                     if datestamp == today or (datestamp == yesterday and (hour > thour or (hour == thour and (mins > tmin or (mins == tmin and sec > tsec))))):
                         is_thours = True
-                    if '\t' in line:
-                        separator = '\t'
-                    else: separator = ','
-                    newline = line.split(separator)
-                    newmode = int(newline[3])
-                    newback = int(newline[4])
-                    newpercent = int(newline[2])
-                    newmanual = bool(int(newline[7]))
-                    newsession_number = int(newline[8])
-                    try:
-                        sesstime = int(round(float(newline[25])))
-                    except Exception as e:
-                        debug_msg(e)
-                        # this session wasn't performed with this version of BW, and is therefore
-                        # old, and therefore the session time doesn't matter
-                        sesstime = 0
+                    newmode = rec['mode']
+                    newback = rec['nback']
+                    newpercent = rec['percent']
+                    newmanual = bool(rec['manual'])
+                    newsession_number = rec['session']
+                    sesstime = rec['sesstime']
                     if newmanual:
                         newsession_number = 0
                     self.full_history.append([newsession_number, newmode, newback, newpercent, newmanual])
@@ -3818,9 +3810,6 @@ class Stats:
                         stats.sessions_today += 1
                         self.time_today += sesstime
                         self.history.append([newsession_number, newmode, newback, newpercent, newmanual])
-                    #if not newmanual and (is_today or cfg.RESET_LEVEL):
-                    #    last_session = self.full_history[-1]
-                statsfile.close()
                 self.retrieve_progress()
 
             except Exception as e:
@@ -4038,6 +4027,7 @@ def update_all_labels(do_analysis=False):
     averageLabel.update()
     todayLabel.update()
     trialsRemainingLabel.update()
+    nativeBackendLabel.update()
 
     update_input_labels()
 
@@ -4087,10 +4077,9 @@ def new_session():
     if preventMusicSkipping: pyglet.clock.tick(poll=True) # Prevent music/applause skipping
 
     if cfg.VARIABLE_NBACK:
-        # compute variable n-back sequence using beta distribution
-        mode.variable_list = []
-        for index in range(0, mode.num_trials_total - mode.back):
-            mode.variable_list.append(int(random.betavariate(mode.back / 2.0, 1) * mode.back + 1))
+        # Beta(n/2, 1) draws — generated in C
+        mode.variable_list = bwaccel.variable_nback_list(
+            mode.num_trials_total - mode.back, mode.back)
     field.crosshair_update()
     reset_input()
     stats.initialize_session()
@@ -4158,54 +4147,27 @@ def reset_input():
 ##    mode.bt_sequence = seq.values()
 
 def compute_bt_sequence():
-    bt_sequence = [[], []]
-    for x in range(0, mode.num_trials_total):
-        bt_sequence[0].append(0)
-        bt_sequence[1].append(0)
-
-    for x in range(0, mode.back):
-        bt_sequence[0][x] = random.randint(1, 8)
-        bt_sequence[1][x] = random.randint(1, 8)
-
-    position = 0
-    audio = 0
-    both = 0
-
-    # brute force it
-    while True:
-        position = 0
-        for x in range(mode.back, mode.num_trials_total):
-            bt_sequence[0][x] = random.randint(1, 8)
-            if bt_sequence[0][x] == bt_sequence[0][x - mode.back]:
-                position += 1
-        if position != 6:
-            continue
-        while True:
-            audio = 0
-            for x in range(mode.back, mode.num_trials_total):
-                bt_sequence[1][x] = random.randint(1, 8)
-                if bt_sequence[1][x] == bt_sequence[1][x - mode.back]:
-                    audio += 1
-            if audio == 6:
-                break
-        both = 0
-        for x in range(mode.back, mode.num_trials_total):
-            if bt_sequence[0][x] == bt_sequence[0][x - mode.back] and bt_sequence[1][x] == bt_sequence[1][x - mode.back]:
-                both += 1
-        if both == 2:
-            break
-
-    mode.bt_sequence = bt_sequence
+    # Constructive generator in C (O(trials)); the old nested rejection
+    # sampler could stall for minutes at high n-back (trials ≈ 20 + n²).
+    mode.bt_sequence = bwaccel.compute_bt_sequence(
+        mode.num_trials_total, mode.back, 6, 6, 2)
 
 player = get_pyglet_media_Player()
 player2 = get_pyglet_media_Player()
 # responsible for the random generation of each new stimulus (audio, color, position)
 def generate_stimulus():
     # first, randomly generate all stimuli
-    positions = random.sample(range(1,9), 4)   # sample without replacement
+    positions = bwaccel.sample_unique(1, 8, 4)   # sample without replacement
     for s, p in zip(range(1, 5), positions):
         mode.current_stim['position' + repr(s)] = p
         mode.current_stim['vis' + repr(s)] = random.randint(1, 8)
+
+    position_cell_order = (1, 2, 3, 6, 4, 5, 7, 8)
+    if not 2 <= cfg.POSITION_CELL_COUNT <= len(position_cell_order):
+        raise ValueError('POSITION_CELL_COUNT must be between 2 and 8')
+    if mode.mode == 10:
+        active_position_cells = position_cell_order[:cfg.POSITION_CELL_COUNT]
+        mode.current_stim['position1'] = random.choice(active_position_cells)
 
     #mode.current_stim['position1'] = random.randint(1, 8)
     mode.current_stim['color']  = random.randint(1, 8)
@@ -4832,6 +4794,7 @@ logoUpperLabel = LogoUpperLabel()
 logoLowerLabel = LogoLowerLabel()
 titleMessageLabel = TitleMessageLabel()
 titleKeysLabel = TitleKeysLabel()
+nativeBackendLabel = NativeBackendLabel()
 pausedLabel = PausedLabel()
 congratsLabel = CongratsLabel()
 sessionInfoLabel = SessionInfoLabel()
