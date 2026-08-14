@@ -23,8 +23,9 @@ try:
     import bwaccel
     import brainworkshop as bw
     from nwenv import (
-        DiagnosticEnv, NeuralWorkshopEnv, derive_public_outcome, digest_rgba,
-        render_significant_frame, verify_public_outcome,
+        DiagnosticEnv, NeuralWorkshopEnv, diagnose_public_outcome,
+        derive_public_outcome, digest_rgba, render_significant_frame,
+        verify_public_outcome,
     )
     _ENV_IMPORT_ERROR = None
 except Exception as exc:
@@ -97,7 +98,13 @@ class CaptureAndPhaseTests(unittest.TestCase):
                          digest_rgba(obs['rgba']))
         self.assertTrue(verify_public_outcome(
             obs['outcome'], obs['rgba'], obs['width'], obs['height'],
-            archive=self.env._archive))
+            archive=self.env._archive,
+            receipt_ledger=self.env._receipt_ledger))
+        self.assertTrue(set(obs['outcome'].keys()) <= {
+            'scalar', 'evidence_digests', 'receipt_id',
+            'frame_seq', 'timestamp_ns'})
+        self.assertNotIn('n_pos', obs['outcome'])
+        self.assertNotIn('n_neg', obs['outcome'])
 
     def test_verify_rejects_forged_digest(self):
         w, h = 20, 24
@@ -127,7 +134,8 @@ class CaptureAndPhaseTests(unittest.TestCase):
                    'rgba', 'done', 'outcome'}
         self.assertTrue(set(obs.keys()) <= allowed)
         for leaked in ('phase', 'position1', 'correct', 'match',
-                       'bt_sequence', 'current_stim', 'feedback'):
+                       'bt_sequence', 'current_stim', 'feedback',
+                       'n_pos', 'n_neg'):
             self.assertNotIn(leaked, obs)
 
     def test_significant_states_once_each(self):
@@ -163,18 +171,22 @@ class ProductionEnvTests(unittest.TestCase):
                 ports = _ports_for('incorrect')
                 if ports:
                     env.act(ports[:1])
+            first = None
             while env.probe.phase() != 'feedback':
-                env.advance()
+                first = env.advance()
             n_out = lambda ev: sum(1 for e in ev if e.get('type') == 'outcome')
             ev1 = n_out(env._events)
             lat1 = len(env.accounting.action_to_outcome_ns)
             self.assertEqual(ev1, 1)
             self.assertEqual(lat1, 1)
+            self.assertIn('outcome', first)
+            pixels = first['rgba']
             for _ in range(3):
-                env.observe()
+                again = env.observe()
+                self.assertNotIn('outcome', again)
+                self.assertEqual(again['rgba'], pixels)
             self.assertEqual(n_out(env._events), 1)
             self.assertEqual(len(env.accounting.action_to_outcome_ns), 1)
-            # Observing again must not mint a new delivered-event key.
             self.assertEqual(len(env._delivered), len(set(env._delivered)))
         finally:
             env.close()
@@ -408,6 +420,58 @@ class ReceiptAndOutcomeTests(unittest.TestCase):
             shuffled, obs['rgba'], obs['width'], obs['height'],
             archive=self.env._archive,
             receipt_ledger=self.env._receipt_ledger))
+
+    def test_foreign_valid_receipt_fails_verify(self):
+        """Another ledger receipt from a different trial must not verify."""
+        env = self.env
+        env.reset(18)
+        collected = []
+        for _ in range(40):
+            if len(collected) >= 2:
+                break
+            if not _next_scorable_stimulus(env):
+                break
+            env.act(_ports_for('incorrect')[:1] or [0])
+            obs = None
+            while env.probe.phase() != 'feedback':
+                obs = env.advance()
+                if env.probe.session_done():
+                    break
+            if not obs or 'outcome' not in obs:
+                continue
+            collected.append({
+                'outcome': dict(obs['outcome']),
+                'rgba': obs['rgba'],
+                'width': obs['width'],
+                'height': obs['height'],
+            })
+        self.assertGreaterEqual(len(collected), 2, 'need two scored trials')
+        a, b = collected[0], collected[1]
+        self.assertNotEqual(a['outcome']['receipt_id'],
+                            b['outcome']['receipt_id'])
+        self.assertTrue(verify_public_outcome(
+            b['outcome'], b['rgba'], b['width'], b['height'],
+            archive=env._archive, receipt_ledger=env._receipt_ledger))
+        swapped = dict(b['outcome'])
+        swapped['receipt_id'] = a['outcome']['receipt_id']
+        self.assertFalse(verify_public_outcome(
+            swapped, b['rgba'], b['width'], b['height'],
+            archive=env._archive, receipt_ledger=env._receipt_ledger),
+            'valid receipt from another trial must not bind')
+
+    def test_count_fields_fail_verify(self):
+        w, h = 20, 24
+        row = bytes([64, 255, 64, 255] * w)
+        rgba = bytes([10, 10, 10, 255] * w) * 18 + row * 6
+        d = digest_rgba(rgba)
+        out = derive_public_outcome(rgba, w, h, [d], 1)
+        self.assertNotIn('n_pos', out)
+        self.assertNotIn('n_neg', out)
+        leaked = dict(out)
+        leaked['n_pos'] = 1
+        leaked['n_neg'] = 0
+        self.assertFalse(verify_public_outcome(
+            leaked, rgba, w, h, archive={d: rgba}))
 
     def test_delayed_resolution_keeps_stimulus_receipt(self):
         """Action during stimulus is resolved only at later feedback."""
@@ -769,7 +833,7 @@ class DualModalityLiveTests(unittest.TestCase):
             self.env.advance()
             if self.env.probe.session_done():
                 return None
-        return derive_public_outcome(
+        return diagnose_public_outcome(
             self.env._rgba, self.env._width, self.env._height,
             self.env._trial_digests,
             self.env._trial_receipt['receipt_id'])
@@ -785,6 +849,12 @@ class DualModalityLiveTests(unittest.TestCase):
         self.assertEqual(out['n_pos'], 1)
         self.assertEqual(out['n_neg'], 1)
         self.assertEqual(out['scalar'], 0.0)
+        public = derive_public_outcome(
+            self.env._rgba, self.env._width, self.env._height,
+            self.env._trial_digests,
+            self.env._trial_receipt['receipt_id'])
+        self.assertNotIn('n_pos', public)
+        self.assertNotIn('n_neg', public)
 
     def test_dual_two_correct(self):
         found = None

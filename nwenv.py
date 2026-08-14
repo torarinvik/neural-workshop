@@ -10,10 +10,11 @@ advance()   → observation
 step(ports) → (observation, events, done)
 
 Observation fields: frame_seq, timestamp_ns, width, height, rgba, done,
-optional outcome {scalar, evidence_digests, receipt_id}.
+optional drain-once outcome {scalar, evidence_digests, receipt_id,
+frame_seq, timestamp_ns}.
 
-No cell IDs, modality names, phase names, scores, or sequences.
-Actions are opaque integer port indices.
+No cell IDs, modality names, phase names, scores, label counts, or
+sequences. Actions are opaque integer port indices.
 
 Shared-memory export (NW_SHM) is a one-way framebuffer dump, not a
 complete cross-process control protocol (no seqlock, no action channel,
@@ -102,7 +103,27 @@ def _channel_close(pixel, target, tol):
     return all(abs(int(pixel[i]) - target[i]) <= tol for i in range(3))
 
 
-def derive_public_outcome(rgba, width, height, evidence_digests, receipt_id):
+_PUBLIC_OUTCOME_KEYS = (
+    'scalar', 'evidence_digests', 'receipt_id', 'frame_seq', 'timestamp_ns',
+)
+
+
+def _label_run_scalar(rgba, width, height):
+    """Return (n_pos, n_neg, scalar) or (0, 0, None) if no labels."""
+    if not rgba or width < 1 or height < 1:
+        return 0, 0, None
+    y0 = int(height * 0.75)
+    n_pos, n_neg, n_oops = bwaccel.count_feedback_label_runs(
+        rgba, width, height, y0, height)
+    n_bad = n_neg + n_oops
+    total = n_pos + n_bad
+    if total == 0:
+        return 0, 0, None
+    return int(n_pos), int(n_bad), (n_pos - n_bad) / float(total)
+
+
+def derive_public_outcome(rgba, width, height, evidence_digests, receipt_id,
+                          frame_seq=None, timestamp_ns=None):
     """Scalar from public feedback *labels*, not pixel mass.
 
     Each closed horizontal run of a feedback color is one label
@@ -111,35 +132,70 @@ def derive_public_outcome(rgba, width, height, evidence_digests, receipt_id):
     Green = +1, red/blue = -1.
     ``scalar = (n_pos - n_neg) / (n_pos + n_neg)``.
     No labels → None (not zero). Never reads game state.
+
+    Learner-facing payload has no label counts.
     """
-    if not rgba or width < 1 or height < 1:
+    _n_pos, _n_neg, scalar = _label_run_scalar(rgba, width, height)
+    if scalar is None:
         return None
-    y0 = int(height * 0.75)
-    n_pos, n_neg, n_oops = bwaccel.count_feedback_label_runs(
-        rgba, width, height, y0, height)
-    n_bad = n_neg + n_oops
-    total = n_pos + n_bad
-    if total == 0:
-        return None
-    scalar = (n_pos - n_bad) / float(total)
-    return {
+    out = {
         'scalar': scalar,
         'evidence_digests': list(evidence_digests),
         'receipt_id': receipt_id,
-        'n_pos': int(n_pos),
-        'n_neg': int(n_bad),
     }
+    if frame_seq is not None:
+        out['frame_seq'] = frame_seq
+    if timestamp_ns is not None:
+        out['timestamp_ns'] = timestamp_ns
+    return out
+
+
+def diagnose_public_outcome(rgba, width, height, evidence_digests, receipt_id):
+    """Diagnostic helper: public outcome plus private label-run counts."""
+    n_pos, n_neg, scalar = _label_run_scalar(rgba, width, height)
+    if scalar is None:
+        return None
+    out = derive_public_outcome(
+        rgba, width, height, evidence_digests, receipt_id)
+    out['n_pos'] = n_pos
+    out['n_neg'] = n_neg
+    return out
+
+
+def _receipt_bound_to_evidence(rec, evidence):
+    """True only if this ledger receipt owns this evidence sequence."""
+    if not rec or not evidence:
+        return False
+    stim = rec.get('stimulus_digest')
+    if not stim or stim != evidence[0]:
+        return False
+    bound = rec.get('evidence_digests')
+    if bound is not None and list(bound) != list(evidence):
+        return False
+    feedback = rec.get('feedback_digest')
+    if feedback is not None and feedback != evidence[-1]:
+        return False
+    trial_seq = rec.get('trial_seq')
+    if trial_seq is not None and rec.get('receipt_id') not in (None, trial_seq):
+        return False
+    return True
 
 
 def verify_public_outcome(outcome, rgba, width, height, archive=None,
                           receipt_ledger=None):
-    """Authenticate every evidence digest, then recompute the scalar.
+    """Authenticate evidence, bind the receipt, then recompute the scalar.
 
     If the outcome lists more than one evidence frame, ``archive`` is
     mandatory. Each digest must map to immutable bytes that hash to it.
     The current frame must match the last digest.
+
+    When ``receipt_ledger`` is given, the receipt must exist *and* be
+    bound to this stimulus digest / evidence sequence / action window.
+    Another valid receipt from a different trial is rejected.
     """
     if not outcome:
+        return False
+    if any(k not in _PUBLIC_OUTCOME_KEYS for k in outcome):
         return False
     evidence = list(outcome.get('evidence_digests') or [])
     if not evidence:
@@ -150,7 +206,8 @@ def verify_public_outcome(outcome, rgba, width, height, archive=None,
     if len(evidence) > 1 and archive is None:
         return False
     if receipt_ledger is not None:
-        if outcome.get('receipt_id') not in receipt_ledger:
+        rec = receipt_ledger.get(outcome.get('receipt_id'))
+        if rec is None or not _receipt_bound_to_evidence(rec, evidence):
             return False
     if archive is not None:
         for digest in evidence:
@@ -353,8 +410,12 @@ class NeuralWorkshopEnv(object):
         return self.observe()
 
     def observe(self):
-        """Return the current frame. Never publishes or re-enqueues events."""
+        """Return the current frame. Never publishes or re-enqueues events.
+
+        The framebuffer may be re-read; the verifier outcome is drain-once.
+        """
         obs = self._observation()
+        self._cached_outcome = None
         self._consumed = True
         self._pending = False
         self._export.write(self._seq, self._timestamp_ns,
@@ -384,13 +445,17 @@ class NeuralWorkshopEnv(object):
         buttons = [names[i] for i in indices if 0 <= i < len(names)]
         bw.inject_match_action(buttons)
         self._action_finalized = True
+        held = self._trial_receipt
         self._trial_receipt = {
             'ok': True,
-            'receipt_id': self._trial_receipt['receipt_id'],
-            'frame_seq': self._seq,
+            'receipt_id': held['receipt_id'],
+            'trial_seq': held.get('trial_seq', held['receipt_id']),
+            'frame_seq': held['frame_seq'],
             'timestamp_ns': _now_ns(),
             'ports': tuple(indices),
             'logp': logp,
+            'stimulus_digest': held.get('stimulus_digest'),
+            'window_open_ns': held.get('window_open_ns'),
         }
         self._receipt_ledger[self._trial_receipt['receipt_id']] = dict(
             self._trial_receipt)
@@ -449,13 +514,17 @@ class NeuralWorkshopEnv(object):
         self._response_open = True
         self._action_finalized = False
         self._receipt_seq += 1
+        now = _now_ns()
         self._trial_receipt = {
             'ok': True,
             'receipt_id': self._receipt_seq,
+            'trial_seq': self._receipt_seq,
             'frame_seq': self._seq,
-            'timestamp_ns': _now_ns(),
+            'timestamp_ns': now,
             'ports': (),
             'logp': None,
+            'stimulus_digest': self._digest,
+            'window_open_ns': now,
         }
         self._receipt_ledger[self._receipt_seq] = dict(self._trial_receipt)
 
@@ -518,25 +587,33 @@ class NeuralWorkshopEnv(object):
         self._cached_outcome = None
         if phase == 'feedback':
             rid = (self._trial_receipt or {}).get('receipt_id')
+            if rid is not None and rid in self._receipt_ledger:
+                bound = self._receipt_ledger[rid]
+                bound['evidence_digests'] = list(self._trial_digests)
+                bound['feedback_digest'] = self._digest
+                bound['feedback_frame_seq'] = self._seq
             key = ('outcome', rid)
             if key not in self._delivered:
                 outcome = derive_public_outcome(
-                    rgba, w, h, self._trial_digests, rid)
+                    rgba, w, h, self._trial_digests, rid,
+                    frame_seq=self._seq, timestamp_ns=self._timestamp_ns)
                 if outcome is not None:
-                    self._cached_outcome = outcome
+                    public = {k: outcome[k] for k in _PUBLIC_OUTCOME_KEYS
+                              if k in outcome}
+                    self._cached_outcome = public
                     ev_key = (
-                        outcome['receipt_id'],
-                        tuple(outcome['evidence_digests']),
-                        outcome['scalar'],
+                        public['receipt_id'],
+                        tuple(public['evidence_digests']),
+                        public['scalar'],
                     )
                     self.accounting.authenticated_outcomes.add(ev_key)
                     emitted = self._emit_once(key, {
                         'type': 'outcome',
-                        'scalar': outcome['scalar'],
-                        'evidence_digests': outcome['evidence_digests'],
-                        'receipt_id': outcome['receipt_id'],
-                        'frame_seq': self._seq,
-                        'timestamp_ns': self._timestamp_ns,
+                        'scalar': public['scalar'],
+                        'evidence_digests': public['evidence_digests'],
+                        'receipt_id': public['receipt_id'],
+                        'frame_seq': public['frame_seq'],
+                        'timestamp_ns': public['timestamp_ns'],
                     })
                     if emitted and self._trial_receipt:
                         lat = (self._timestamp_ns
