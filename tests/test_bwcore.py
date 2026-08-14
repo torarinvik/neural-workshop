@@ -88,6 +88,8 @@ class GridLayoutTests(unittest.TestCase):
         self.assertEqual(bwaccel.grid_cell_count(10), 100)
         self.assertEqual(bwaccel.grid_cell_count(16), 256)
         self.assertEqual(bwaccel.position_col_row(256, 16), (15, 15))
+        self.assertEqual(bwaccel.grid_cell_count(32), 1024)
+        self.assertEqual(bwaccel.position_col_row(1024, 32), (31, 31))
 
     def test_5x5_skips_center_unless_asked(self):
         self.assertEqual(bwaccel.grid_cell_count(5, False), 24)

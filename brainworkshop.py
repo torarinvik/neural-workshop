@@ -321,7 +321,7 @@ CROSSHAIRS = True
 # GRID_SIZE_MAX is the upper bound for config and the in-game cycler (2..max).
 GRID_SIZE = 3
 GRID_SIZE_MIN = 2
-GRID_SIZE_MAX = 16
+GRID_SIZE_MAX = 32
 GRID_INCLUDE_CENTER = False
 
 # Set the color of the square in non-Color N-Back modes.
@@ -788,7 +788,7 @@ def parse_config(configpath):
         cfg.CHANCE_OF_INTERFERENCE = cfg.DEFAULT_CHANCE_OF_INTERFERENCE
     try:
         gmin = int(cfg.GRID_SIZE_MIN) if cfg.GRID_SIZE_MIN is not None else 2
-        gmax = int(cfg.GRID_SIZE_MAX) if cfg.GRID_SIZE_MAX is not None else 16
+        gmax = int(cfg.GRID_SIZE_MAX) if cfg.GRID_SIZE_MAX is not None else 32
         if gmin < 2:
             gmin = 2
         if gmax < gmin:
@@ -799,7 +799,7 @@ def parse_config(configpath):
     except Exception:
         cfg.GRID_SIZE = 3
         cfg.GRID_SIZE_MIN = 2
-        cfg.GRID_SIZE_MAX = 16
+        cfg.GRID_SIZE_MAX = 32
     if cfg.GRID_INCLUDE_CENTER is None:
         cfg.GRID_INCLUDE_CENTER = False
     rtrn = get_argv('--statsfile')
@@ -2504,7 +2504,7 @@ def current_grid_bounds():
     try:
         gmax = int(cfg.GRID_SIZE_MAX)
     except Exception:
-        gmax = 16
+        gmax = 32
     gmin = max(2, gmin)
     gmax = max(gmin, gmax)
     return gmin, gmax

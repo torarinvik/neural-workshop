@@ -51,7 +51,7 @@ The board is `GRID_SIZE` × `GRID_SIZE`. Squares, letters, and images
 scale to fit a single cell. Default `3` is classic Dual N-Back (8 cells,
 center empty). A 4×4 board uses all 16 cells. Change it in **C: Choose Game
 Mode** (*Grid size*) or in `config.ini` (`GRID_SIZE = 10`). Allowed sizes
-are `GRID_SIZE_MIN`–`GRID_SIZE_MAX` (defaults 2–16). Odd sizes skip
+are `GRID_SIZE_MIN`–`GRID_SIZE_MAX` (defaults 2–32). Odd sizes skip
 the center cell unless `GRID_INCLUDE_CENTER = True`.
 
 ### Native C kernels (recommended)

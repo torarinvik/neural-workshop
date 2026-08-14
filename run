@@ -1,0 +1,12 @@
+#!/bin/sh
+# Launch Neural Workshop with the project venv (has pyglet + bwcore).
+ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+cd "$ROOT"
+if [ ! -x "$ROOT/.venv/bin/python" ]; then
+    echo "No .venv found. Create one and install pyglet:"
+    echo "  uv venv --python 3.13"
+    echo "  uv pip install 'pyglet>=2' --python .venv/bin/python"
+    echo "  .venv/bin/python setup.py build_ext --inplace"
+    exit 1
+fi
+exec "$ROOT/.venv/bin/python" "$ROOT/brainworkshop.py" "$@"
