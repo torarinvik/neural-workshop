@@ -1204,6 +1204,95 @@ static PyObject *py_count_feedback_pixels(PyObject *self, PyObject *args)
     return Py_BuildValue("(lll)", pos, neg, oops);
 }
 
+/* Count labels: column class + close intra-caption gaps. */
+static PyObject *py_count_feedback_label_runs(PyObject *self, PyObject *args)
+{
+    Py_buffer buf;
+    int w, h, y0, y1;
+    const unsigned char *p;
+    int x, y;
+    unsigned char *cls;
+    int gap_thresh;
+    long pos_runs = 0, neg_runs = 0, oops_runs = 0;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*iiii", &buf, &w, &h, &y0, &y1))
+        return NULL;
+    if (w < 1 || h < 1 || buf.len < (Py_ssize_t)w * (Py_ssize_t)h * 4) {
+        PyBuffer_Release(&buf);
+        PyErr_SetString(PyExc_ValueError, "framebuffer size does not match w*h*4");
+        return NULL;
+    }
+    if (y0 < 0)
+        y0 = 0;
+    if (y1 > h)
+        y1 = h;
+    if (y1 < y0)
+        y1 = y0;
+    cls = (unsigned char *)PyMem_Malloc((size_t)w);
+    if (cls == NULL) {
+        PyBuffer_Release(&buf);
+        return PyErr_NoMemory();
+    }
+    p = (const unsigned char *)buf.buf;
+    for (x = 0; x < w; ++x) {
+        long pos = 0, neg = 0, oops = 0;
+        int c = 0;
+        for (y = y0; y < y1; ++y) {
+            const unsigned char *px = p + ((Py_ssize_t)y * w + x) * 4;
+            unsigned char r = px[0], g = px[1], b = px[2];
+            if (g >= 180 && r <= 140 && b <= 140)
+                ++pos;
+            else if (r >= 180 && g <= 140 && b <= 140)
+                ++neg;
+            else if (b >= 180 && r <= 140 && g <= 140)
+                ++oops;
+        }
+        if (pos >= 2 && pos >= neg && pos >= oops)
+            c = 1;
+        else if (neg >= 2 && neg >= oops)
+            c = 2;
+        else if (oops >= 2)
+            c = 3;
+        cls[x] = (unsigned char)c;
+    }
+    PyBuffer_Release(&buf);
+    gap_thresh = 8;
+    if (w / 40 > gap_thresh)
+        gap_thresh = w / 40;
+    x = 0;
+    while (x < w) {
+        int c = cls[x];
+        if (c == 0) {
+            ++x;
+            continue;
+        }
+        ++x;
+        for (;;) {
+            while (x < w && cls[x] == (unsigned char)c)
+                ++x;
+            {
+                int z = x;
+                while (z < w && cls[z] == 0)
+                    ++z;
+                if (z < w && cls[z] == (unsigned char)c && (z - x) < gap_thresh) {
+                    x = z;
+                    continue;
+                }
+            }
+            break;
+        }
+        if (c == 1)
+            ++pos_runs;
+        else if (c == 2)
+            ++neg_runs;
+        else
+            ++oops_runs;
+    }
+    PyMem_Free(cls);
+    return Py_BuildValue("(lll)", pos_runs, neg_runs, oops_runs);
+}
+
 static PyObject *py_backend(PyObject *self, PyObject *args)
 {
     (void)self;
@@ -1238,6 +1327,8 @@ static PyMethodDef BwcoreMethods[] = {
     {"seed", py_seed, METH_VARARGS, "seed() entropy; seed(n) including n=0 is deterministic"},
     {"count_feedback_pixels", py_count_feedback_pixels, METH_VARARGS,
      "count_feedback_pixels(rgba, w, h, y0, y1) -> (pos, neg, oops)"},
+    {"count_feedback_label_runs", py_count_feedback_label_runs, METH_VARARGS,
+     "count_feedback_label_runs(rgba, w, h, y0, y1) -> (pos_runs, neg_runs, oops_runs)"},
     {"backend", py_backend, METH_NOARGS, "Return 'C'"},
     {NULL, NULL, 0, NULL}
 };

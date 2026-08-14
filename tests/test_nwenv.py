@@ -23,11 +23,12 @@ try:
     import bwaccel
     import brainworkshop as bw
     from nwenv import (
-        NeuralWorkshopEnv, derive_public_outcome, digest_rgba,
+        DiagnosticEnv, NeuralWorkshopEnv, derive_public_outcome, digest_rgba,
         render_significant_frame, verify_public_outcome,
     )
     _ENV_IMPORT_ERROR = None
 except Exception as exc:
+    DiagnosticEnv = None
     NeuralWorkshopEnv = None
     _ENV_IMPORT_ERROR = exc
 
@@ -65,11 +66,11 @@ def _next_scorable_stimulus(env, limit=40):
     return False
 
 
-@unittest.skipIf(NeuralWorkshopEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
 class CaptureAndPhaseTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.env = NeuralWorkshopEnv(seed=5)
+        cls.env = DiagnosticEnv(seed=5)
 
     @classmethod
     def tearDownClass(cls):
@@ -112,6 +113,13 @@ class CaptureAndPhaseTests(unittest.TestCase):
         forged = dict(outcome)
         forged['evidence_digests'] = ['forged']
         self.assertFalse(verify_public_outcome(forged, rgba, w, h, archive))
+        earlier = dict(outcome)
+        earlier['evidence_digests'] = ['forged-stim', real_d]
+        self.assertFalse(
+            verify_public_outcome(earlier, rgba, w, h, archive=None),
+            'multi-frame evidence requires an archive')
+        self.assertFalse(
+            verify_public_outcome(earlier, rgba, w, h, archive=archive))
 
     def test_public_observation_schema(self):
         obs = self.env.reset(1)
@@ -135,11 +143,82 @@ class CaptureAndPhaseTests(unittest.TestCase):
         self.assertIn(phases[1], ('blank', 'feedback'))
 
 
-@unittest.skipIf(NeuralWorkshopEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+class ProductionEnvTests(unittest.TestCase):
+    def test_production_has_no_probe(self):
+        os.environ.pop('NW_DIAGNOSTICS', None)
+        env = NeuralWorkshopEnv(seed=1)
+        try:
+            self.assertFalse(hasattr(env, 'probe'))
+            with self.assertRaises(RuntimeError):
+                NeuralWorkshopEnv(seed=1, diagnostics=True)
+        finally:
+            env.close()
+
+    def test_observe_emits_outcome_once(self):
+        env = DiagnosticEnv(seed=7)
+        try:
+            self.assertTrue(_next_scorable_stimulus(env))
+            if not _ports_for('correct'):
+                ports = _ports_for('incorrect')
+                if ports:
+                    env.act(ports[:1])
+            while env.probe.phase() != 'feedback':
+                env.advance()
+            n_out = lambda ev: sum(1 for e in ev if e.get('type') == 'outcome')
+            ev1 = n_out(env._events)
+            lat1 = len(env.accounting.action_to_outcome_ns)
+            self.assertEqual(ev1, 1)
+            self.assertEqual(lat1, 1)
+            for _ in range(3):
+                env.observe()
+            self.assertEqual(n_out(env._events), 1)
+            self.assertEqual(len(env.accounting.action_to_outcome_ns), 1)
+            # Observing again must not mint a new delivered-event key.
+            self.assertEqual(len(env._delivered), len(set(env._delivered)))
+        finally:
+            env.close()
+
+    def test_session_end_emits_once(self):
+        env = DiagnosticEnv(seed=8, num_trials=4)
+        try:
+            done = False
+            guard = 0
+            while not done and guard < 80:
+                obs = env.advance()
+                done = bool(obs.get('done'))
+                guard += 1
+            self.assertTrue(done)
+            n_end = sum(1 for e in env._events if e.get('type') == 'session_end')
+            self.assertEqual(n_end, 1)
+            seq = env._seq
+            for _ in range(4):
+                obs = env.advance()
+                self.assertTrue(obs.get('done'))
+                self.assertEqual(obs['frame_seq'], seq)
+            self.assertEqual(
+                sum(1 for e in env._events if e.get('type') == 'session_end'), 1)
+        finally:
+            env.close()
+
+    def test_act_stores_logp_on_receipt(self):
+        env = DiagnosticEnv(seed=3)
+        try:
+            rec = env.act(0, logp=-1.25)
+            self.assertTrue(rec.get('ok'))
+            self.assertEqual(rec.get('logp'), -1.25)
+            self.assertEqual(env._trial_receipt['logp'], -1.25)
+            self.assertEqual(
+                env._receipt_ledger[rec['receipt_id']]['logp'], -1.25)
+        finally:
+            env.close()
+
+
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
 class ReceiptAndOutcomeTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.env = NeuralWorkshopEnv(seed=2)
+        cls.env = DiagnosticEnv(seed=2, num_trials=12)
 
     @classmethod
     def tearDownClass(cls):
@@ -308,12 +387,123 @@ class ReceiptAndOutcomeTests(unittest.TestCase):
         archive = {d: rgba}
         self.assertFalse(verify_public_outcome(shuffled, rgba, w, h, archive))
 
+    def test_action_shuffled_receipt_fails_verify(self):
+        self.env.reset(15)
+        self.assertTrue(_next_scorable_stimulus(self.env))
+        self.env.act(0)
+        while self.env.probe.phase() != 'feedback':
+            self.env.advance()
+        obs = {
+            'rgba': self.env._rgba, 'width': self.env._width,
+            'height': self.env._height,
+        }
+        out = derive_public_outcome(
+            obs['rgba'], obs['width'], obs['height'],
+            self.env._trial_digests,
+            self.env._trial_receipt['receipt_id'])
+        self.assertIsNotNone(out)
+        shuffled = dict(out)
+        shuffled['receipt_id'] = out['receipt_id'] + 999
+        self.assertFalse(verify_public_outcome(
+            shuffled, obs['rgba'], obs['width'], obs['height'],
+            archive=self.env._archive,
+            receipt_ledger=self.env._receipt_ledger))
 
-@unittest.skipIf(NeuralWorkshopEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+    def test_delayed_resolution_keeps_stimulus_receipt(self):
+        """Action during stimulus is resolved only at later feedback."""
+        self.env.reset(16)
+        self.assertTrue(_next_scorable_stimulus(self.env))
+        stim = dict(self.env.probe.stim())
+        rec = self.env.act(_ports_for('incorrect')[:1] or [0])
+        self.assertTrue(rec.get('ok'))
+        rid = rec['receipt_id']
+        self.assertNotIn('outcome', self.env.observe())
+        while self.env.probe.phase() == 'stimulus':
+            obs = self.env.advance()
+            if self.env.probe.phase() != 'feedback':
+                self.assertNotIn('outcome', obs)
+        self.assertFalse(self.env._response_open)
+        while self.env.probe.phase() != 'feedback':
+            obs = self.env.advance()
+            if self.env.probe.phase() != 'feedback':
+                self.assertNotIn('outcome', obs)
+        self.assertEqual(self.env._trial_receipt['receipt_id'], rid)
+        out = derive_public_outcome(
+            self.env._rgba, self.env._width, self.env._height,
+            self.env._trial_digests, rid)
+        self.assertIsNotNone(out)
+        self.assertEqual(out['receipt_id'], rid)
+        acted_scalar = out['scalar']
+
+        # Same seed, no action: delayed resolution is causal, not a stimulus tag.
+        self.env.reset(16)
+        self.assertTrue(_next_scorable_stimulus(self.env))
+        self.assertEqual(self.env.probe.stim(), stim)
+        while self.env.probe.phase() != 'feedback':
+            self.env.advance()
+        idle = derive_public_outcome(
+            self.env._rgba, self.env._width, self.env._height,
+            self.env._trial_digests,
+            self.env._trial_receipt['receipt_id'])
+        idle_scalar = None if idle is None else idle['scalar']
+        self.assertNotEqual(acted_scalar, idle_scalar)
+
+    def test_action_shuffled_control_changes_outcomes(self):
+        """Same stimuli, permuted trial-actions: outcome sequence must move."""
+        env = self.env
+        actions = [[0], [1] if env.n_actions > 1 else [0], [], [0],
+                   [1] if env.n_actions > 1 else [], [], [0],
+                   [1] if env.n_actions > 1 else [0]]
+
+        def collect(act_list):
+            env.reset(17)
+            stims, outcomes, receipts = [], [], []
+            box = [0]
+
+            def maybe_act():
+                if env.probe.phase() != 'stimulus':
+                    return
+                if bw.mode.trial_number <= bw.mode.back:
+                    return
+                if box[0] >= len(act_list):
+                    return
+                rec = env.act(act_list[box[0]])
+                box[0] += 1
+                receipts.append((rec.get('receipt_id'), tuple(rec.get('ports') or ())))
+                stims.append((bw.mode.trial_number, tuple(sorted(
+                    env.probe.stim().items()))))
+
+            maybe_act()
+            for _ in range(80):
+                if env.probe.session_done():
+                    break
+                env.advance()
+                if env.probe.phase() == 'feedback':
+                    out = derive_public_outcome(
+                        env._rgba, env._width, env._height,
+                        env._trial_digests,
+                        (env._trial_receipt or {}).get('receipt_id'))
+                    outcomes.append(None if out is None else out['scalar'])
+                maybe_act()
+            return stims, outcomes, receipts
+
+        a = collect(actions)
+        shuffled = list(actions)
+        rng = random.Random(0)
+        rng.shuffle(shuffled)
+        if shuffled == actions:
+            shuffled = list(reversed(actions))
+        b = collect(shuffled)
+        self.assertEqual(a[0], b[0], 'stimuli must be seed-identical')
+        self.assertNotEqual(a[1], b[1], 'shuffled actions must move outcomes')
+        self.assertNotEqual(a[2], b[2], 'receipts must follow the permuted acts')
+
+
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
 class DeterminismTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.env = NeuralWorkshopEnv(seed=0)
+        cls.env = DiagnosticEnv(seed=0)
 
     @classmethod
     def tearDownClass(cls):
@@ -349,70 +539,135 @@ class DeterminismTests(unittest.TestCase):
             self.assertEqual(a[3], b[3], 'stims seed=%s' % seed)
 
 
-@unittest.skipIf(NeuralWorkshopEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
 class ParityTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.env = NeuralWorkshopEnv(seed=13)
+        cls.env = DiagnosticEnv(seed=13, game_mode=2, num_trials=6)
 
     @classmethod
     def tearDownClass(cls):
         cls.env.close()
 
-    def test_step_vs_scheduled_update_parity(self):
-        """Headless step path vs the scheduled update() callback (human clock)."""
-        seed = 13
-        n_frames = 8
-        first = self.env.reset(seed)
-        step_digests = [digest_rgba(first['rgba'])]
-        step_stims = [dict(self.env.probe.stim())]
-        step_term = False
-        for _ in range(n_frames - 1):
-            obs = self.env.advance()
-            step_digests.append(digest_rgba(obs['rgba']))
-            if self.env.probe.phase() == 'stimulus':
-                step_stims.append(dict(self.env.probe.stim()))
-            if obs.get('done'):
-                step_term = True
-                break
-        step_trial = bw.mode.trial_number
-        step_inputs = dict(bw.mode.inputs)
+    @staticmethod
+    def _policy(trial_number):
+        if trial_number <= 2:
+            return []
+        return [0] if trial_number % 2 == 0 else []
 
+    def _bootstrap_clock_session(self, seed):
         random.seed(seed)
         bwaccel.seed(seed)
         if bw.mode.started:
             bw.end_session(cancelled=True)
         bw.mode.step_mode = True
+        bw.mode.session_done = False
+        bw.mode.phase = None
         bw.mode.session_number = 0
+        bw.mode.progress = 0
         bw.cfg.SHOW_FEEDBACK = True
         bw.cfg.ANIMATE_SQUARES = False
         bw.mode.hide_text = False
+        bw.mode.mode = 2
+        bw.cfg.GAME_MODE = 2
+        bw.mode.num_trials = 6
+        bw.mode.num_trials_factor = 0
+        bw.mode.num_trials_total = 6
         bw.new_session()
         bw.mode.tick = 0
         bw.mode.phase = None
         bw.mode.session_number = 1
+        bw.mode.num_trials = 6
+        bw.mode.num_trials_factor = 0
+        bw.mode.num_trials_total = 6
         random.seed(seed)
         bwaccel.seed(seed)
-        # Human scheduled path: the same update() pyglet would call.
         bw.mode.step_mode = False
+
+    def test_step_vs_scheduled_update_parity(self):
+        """Full-session headless step path vs scheduled update() (human clock)."""
+        seed = 13
+        env = self.env
+        first = env.reset(seed)
+        self.assertEqual(env.probe.phase(), 'stimulus')
+        rec0 = env.act(self._policy(bw.mode.trial_number), logp=-0.5)
+        step_digests = [digest_rgba(first['rgba'])]
+        step_stims = [dict(env.probe.stim())]
+        step_receipts = [(rec0.get('receipt_id'), tuple(rec0.get('ports') or ()),
+                          rec0.get('logp'))]
+        step_outcomes = []
+        step_inputs = []
+        step_term = False
+        while True:
+            obs, ev, done = env.step(None)
+            step_digests.append(digest_rgba(obs['rgba']))
+            phase = env.probe.phase()
+            if phase == 'stimulus':
+                step_stims.append(dict(env.probe.stim()))
+                rec = env.act(self._policy(bw.mode.trial_number),
+                              logp=-0.5 if bw.mode.trial_number % 2 == 0 else None)
+                step_receipts.append((
+                    rec.get('receipt_id'), tuple(rec.get('ports') or ()),
+                    rec.get('logp')))
+            if phase == 'feedback':
+                step_inputs.append(dict(bw.mode.inputs))
+            for e in ev:
+                if e.get('type') == 'outcome':
+                    step_outcomes.append(e['scalar'])
+            if done:
+                step_term = True
+                break
+            if len(step_digests) > 80:
+                self.fail('step path did not terminate')
+        step_trial = bw.mode.trial_number
+        step_session = {
+            'position1': list(bw.stats.session.get('position1', [])),
+            'audio': list(bw.stats.session.get('audio', [])),
+            'position1_input': list(bw.stats.session.get('position1_input', [])),
+            'audio_input': list(bw.stats.session.get('audio_input', [])),
+        }
+        step_stats = env.accounting.snapshot()
+        sessions_today = bw.stats.sessions_today
+
+        self._bootstrap_clock_session(seed)
+        bw.stats.sessions_today = sessions_today
         try:
-            bw.window.set_visible(True)
+            bw.window.set_visible(False)
         except Exception:
             pass
         clock_digests = []
         clock_stims = []
+        clock_receipts = []
+        clock_outcomes = []
+        clock_inputs = []
         last_phase = None
         guard = 0
-        while len(clock_digests) < len(step_digests) and guard < 20000:
+        clock_term = False
+        while guard < 20000:
             bw.update(0.001)
             ph = bw.mode.phase
             if ph and ph != last_phase:
-                if ph == 'stimulus':
-                    clock_stims.append(dict(bw.mode.current_stim))
+                # Capture *before* injecting, matching step: publish then act.
                 w, h, rgba = render_significant_frame()
                 clock_digests.append(digest_rgba(rgba))
+                if ph == 'stimulus':
+                    clock_stims.append(dict(bw.mode.current_stim))
+                    names = bw.action_button_names()
+                    ports = self._policy(bw.mode.trial_number)
+                    buttons = [names[i] for i in ports if 0 <= i < len(names)]
+                    bw.inject_match_action(buttons)
+                    clock_receipts.append((
+                        bw.mode.trial_number, tuple(ports),
+                        -0.5 if bw.mode.trial_number % 2 == 0 else None))
+                if ph == 'feedback':
+                    clock_inputs.append(dict(bw.mode.inputs))
+                    out = derive_public_outcome(
+                        rgba, w, h, [digest_rgba(rgba)], bw.mode.trial_number)
+                    if out is not None:
+                        clock_outcomes.append(out['scalar'])
                 last_phase = ph
             if bw.mode.phase == 'done' or not bw.mode.started:
+                clock_term = True
                 break
             guard += 1
         try:
@@ -420,11 +675,158 @@ class ParityTests(unittest.TestCase):
         except Exception:
             pass
         bw.mode.step_mode = True
-        self.assertEqual(step_stims[:1], clock_stims[:1])
-        self.assertEqual(step_digests, clock_digests[:len(step_digests)])
+        clock_session = {
+            'position1': list(bw.stats.session.get('position1', [])),
+            'audio': list(bw.stats.session.get('audio', [])),
+            'position1_input': list(bw.stats.session.get('position1_input', [])),
+            'audio_input': list(bw.stats.session.get('audio_input', [])),
+        }
+
+        self.assertTrue(step_term)
+        self.assertTrue(clock_term)
+        self.assertEqual(step_stims, clock_stims)
+        # In-session frames must match. The post-session analysis overlay
+        # includes session counters / timestamps, so the terminal digest is
+        # not part of the trial protocol.
+        self.assertGreaterEqual(len(step_digests), 2)
+        self.assertEqual(len(step_digests), len(clock_digests))
+        self.assertEqual(step_digests[:-1], clock_digests[:-1])
+        self.assertEqual([r[1] for r in step_receipts],
+                         [r[1] for r in clock_receipts])
+        self.assertEqual(step_inputs, clock_inputs)
+        self.assertEqual(step_outcomes, clock_outcomes)
+        self.assertTrue(any(s == 1.0 for s in step_outcomes)
+                        or any(s == -1.0 for s in step_outcomes)
+                        or any(s == 0.0 for s in step_outcomes),
+                        'parity session produced no public outcomes')
         self.assertEqual(step_trial, bw.mode.trial_number)
-        if step_term:
-            self.assertTrue(bw.mode.phase == 'done' or not bw.mode.started)
+        self.assertEqual(step_session, clock_session)
+        self.assertGreaterEqual(step_stats['logical_trials'], 6)
+        self.assertTrue(bw.mode.phase == 'done' or not bw.mode.started)
+
+
+class LabelAggregationTests(unittest.TestCase):
+    def _frame(self, specs):
+        """Build a 80x24 frame with colored column bands in the bottom quarter.
+
+        specs: list of (x0, x1, rgb)
+        """
+        w, h = 80, 24
+        pix = bytearray([10, 10, 10, 255] * (w * h))
+        for x0, x1, rgb in specs:
+            for y in range(18, 24):
+                for x in range(x0, x1):
+                    off = (y * w + x) * 4
+                    pix[off:off + 3] = bytes(rgb)
+        return bytes(pix), w, h
+
+    def test_run_count_invariant_to_band_width(self):
+        narrow, w, h = self._frame([(5, 10, (64, 255, 64)), (40, 45, (255, 64, 64))])
+        wide, _, _ = self._frame([(5, 25, (64, 255, 64)), (40, 70, (255, 64, 64))])
+        a = bwaccel.count_feedback_label_runs(narrow, w, h, 18, 24)
+        b = bwaccel.count_feedback_label_runs(wide, w, h, 18, 24)
+        self.assertEqual(a, (1, 1, 0))
+        self.assertEqual(b, (1, 1, 0))
+        oa = derive_public_outcome(narrow, w, h, ['d'], 1)
+        ob = derive_public_outcome(wide, w, h, ['d'], 1)
+        self.assertEqual(oa['scalar'], 0.0)
+        self.assertEqual(ob['scalar'], 0.0)
+
+    def test_two_correct_two_incorrect(self):
+        two_g, w, h = self._frame([(4, 12, (64, 255, 64)), (30, 38, (64, 255, 64))])
+        two_r, _, _ = self._frame([(4, 12, (255, 64, 64)), (30, 38, (255, 64, 64))])
+        self.assertEqual(derive_public_outcome(two_g, w, h, ['d'], 1)['scalar'], 1.0)
+        self.assertEqual(derive_public_outcome(two_r, w, h, ['d'], 1)['scalar'], -1.0)
+
+    def test_miss_plus_correct(self):
+        mix, w, h = self._frame([(4, 12, (64, 64, 255)), (30, 38, (64, 255, 64))])
+        self.assertEqual(derive_public_outcome(mix, w, h, ['d'], 1)['scalar'], 0.0)
+
+
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+class DualModalityLiveTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.env = DiagnosticEnv(seed=30, game_mode=2, num_trials=24)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.env.close()
+
+    def _seek_ports(self, want_correct, want_incorrect, limit=80):
+        for _ in range(limit):
+            if not _next_scorable_stimulus(self.env):
+                return None, None
+            c = _ports_for('correct')
+            i = _ports_for('incorrect')
+            if len(c) >= want_correct and len(i) >= want_incorrect:
+                return c, i
+            self.env.advance()
+        return None, None
+
+    def _feedback_scalar(self):
+        while self.env.probe.phase() != 'feedback':
+            self.env.advance()
+            if self.env.probe.session_done():
+                return None
+        return derive_public_outcome(
+            self.env._rgba, self.env._width, self.env._height,
+            self.env._trial_digests,
+            self.env._trial_receipt['receipt_id'])
+
+    def test_dual_one_correct_one_incorrect(self):
+        self.env.reset(30)
+        self.assertGreaterEqual(self.env.n_actions, 2)
+        c, i = self._seek_ports(1, 1)
+        self.assertIsNotNone(c)
+        self.env.act([c[0], i[0]])
+        out = self._feedback_scalar()
+        self.assertIsNotNone(out)
+        self.assertEqual(out['n_pos'], 1)
+        self.assertEqual(out['n_neg'], 1)
+        self.assertEqual(out['scalar'], 0.0)
+
+    def test_dual_two_correct(self):
+        found = None
+        for seed in range(31, 80):
+            self.env.reset(seed)
+            c, i = self._seek_ports(2, 0)
+            if c and len(c) >= 2:
+                self.env.act(c[:2])
+                found = self._feedback_scalar()
+                break
+        self.assertIsNotNone(found, 'needed a two-match trial')
+        self.assertEqual(found['n_pos'], 2)
+        self.assertEqual(found['n_neg'], 0)
+        self.assertEqual(found['scalar'], 1.0)
+
+    def test_dual_two_incorrect(self):
+        found = None
+        for seed in range(32, 80):
+            self.env.reset(seed)
+            c, i = self._seek_ports(0, 2)
+            if i and len(i) >= 2:
+                self.env.act(i[:2])
+                found = self._feedback_scalar()
+                break
+        self.assertIsNotNone(found, 'needed a two-nonmatch trial')
+        self.assertEqual(found['n_pos'], 0)
+        self.assertEqual(found['n_neg'], 2)
+        self.assertEqual(found['scalar'], -1.0)
+
+    def test_dual_one_missed_one_correct(self):
+        found = None
+        for seed in range(33, 80):
+            self.env.reset(seed)
+            c, i = self._seek_ports(2, 0)
+            if c and len(c) >= 2:
+                self.env.act(c[:1])  # press one match, miss the other
+                found = self._feedback_scalar()
+                break
+        self.assertIsNotNone(found, 'needed a two-match trial to miss one')
+        self.assertEqual(found['n_pos'], 1)
+        self.assertEqual(found['n_neg'], 1)
+        self.assertEqual(found['scalar'], 0.0)
 
 
 class CurriculumTests(unittest.TestCase):

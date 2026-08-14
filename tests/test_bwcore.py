@@ -311,6 +311,31 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(bwaccel.interval_adjust_step(80), 5)
         self.assertEqual(bwaccel.interval_adjust_step(3000), 100)
 
+    def test_label_runs_not_pixel_mass(self):
+        w, h = 40, 20
+        pix = bytearray([0, 0, 0, 255] * (w * h))
+        # Two green bands of different widths in the bottom quarter
+        for y in range(15, 20):
+            for x in range(2, 6):
+                off = (y * w + x) * 4
+                pix[off:off + 3] = b'\x40\xff\x40'
+            for x in range(20, 35):
+                off = (y * w + x) * 4
+                pix[off:off + 3] = b'\x40\xff\x40'
+        runs = bwaccel.count_feedback_label_runs(bytes(pix), w, h, 15, 20)
+        self.assertEqual(runs[0], 2)
+
+    def test_label_runs_close_glyph_gaps(self):
+        w, h = 80, 20
+        pix = bytearray([0, 0, 0, 255] * (w * h))
+        # One caption: 4-pixel strokes with 3-pixel gaps (must merge).
+        for y in range(15, 20):
+            for x in (4, 5, 6, 7, 11, 12, 13, 14, 18, 19, 20, 21):
+                off = (y * w + x) * 4
+                pix[off:off + 3] = b'\x40\xff\x40'
+        self.assertEqual(
+            bwaccel.count_feedback_label_runs(bytes(pix), w, h, 15, 20)[0], 1)
+
     def test_plan_phases_fits_short_trial(self):
         plan = bwaccel.plan_trial_phases(10, 500, 200, tick_ms=1)
         self.assertEqual(plan['total_ticks'], 10)

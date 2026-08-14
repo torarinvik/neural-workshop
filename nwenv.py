@@ -103,35 +103,41 @@ def _channel_close(pixel, target, tol):
 
 
 def derive_public_outcome(rgba, width, height, evidence_digests, receipt_id):
-    """Deterministic scalar from publicly painted feedback pixels only.
+    """Scalar from public feedback *labels*, not pixel mass.
 
-    Green (correct) → +1. Red (incorrect) and blue (oops/missed/early) → -1.
-    Missing colors or a green/negative tie → None (not zero).
-    Never consults game state, scores, sequences, or cell IDs.
+    Each closed horizontal run of a feedback color is one label
+    (glyph/word gaps inside a caption are merged; separate labels are
+    not). Invariant to caption length and window resolution.
+    Green = +1, red/blue = -1.
+    ``scalar = (n_pos - n_neg) / (n_pos + n_neg)``.
+    No labels → None (not zero). Never reads game state.
     """
     if not rgba or width < 1 or height < 1:
         return None
     y0 = int(height * 0.75)
-    pos, neg, oops = bwaccel.count_feedback_pixels(rgba, width, height, y0, height)
-    negative = neg + oops
-    if pos == 0 and negative == 0:
+    n_pos, n_neg, n_oops = bwaccel.count_feedback_label_runs(
+        rgba, width, height, y0, height)
+    n_bad = n_neg + n_oops
+    total = n_pos + n_bad
+    if total == 0:
         return None
-    if pos == negative:
-        return None
-    scalar = 1.0 if pos > negative else -1.0
+    scalar = (n_pos - n_bad) / float(total)
     return {
         'scalar': scalar,
         'evidence_digests': list(evidence_digests),
         'receipt_id': receipt_id,
+        'n_pos': int(n_pos),
+        'n_neg': int(n_bad),
     }
 
 
-def verify_public_outcome(outcome, rgba, width, height, archive=None):
-    """Authenticate evidence digests against archived frames, then recompute.
+def verify_public_outcome(outcome, rgba, width, height, archive=None,
+                          receipt_ledger=None):
+    """Authenticate every evidence digest, then recompute the scalar.
 
-    ``archive`` maps digest → immutable RGBA bytes. Every declared digest
-    must be present and hash to itself. The current frame must match the
-    last evidence digest.
+    If the outcome lists more than one evidence frame, ``archive`` is
+    mandatory. Each digest must map to immutable bytes that hash to it.
+    The current frame must match the last digest.
     """
     if not outcome:
         return False
@@ -141,6 +147,11 @@ def verify_public_outcome(outcome, rgba, width, height, archive=None):
     current = digest_rgba(rgba)
     if evidence[-1] != current:
         return False
+    if len(evidence) > 1 and archive is None:
+        return False
+    if receipt_ledger is not None:
+        if outcome.get('receipt_id') not in receipt_ledger:
+            return False
     if archive is not None:
         for digest in evidence:
             stored = archive.get(digest)
@@ -251,7 +262,13 @@ class _TestProbe(object):
 
 
 class NeuralWorkshopEnv(object):
-    def __init__(self, seed=None, shm_name=None):
+    def __init__(self, seed=None, shm_name=None, diagnostics=False,
+                 game_mode=None, num_trials=None):
+        if diagnostics and os.environ.get('NW_DIAGNOSTICS') != '1':
+            raise RuntimeError(
+                'diagnostic construction rejected (set NW_DIAGNOSTICS=1)')
+        self._game_mode = game_mode
+        self._num_trials = num_trials
         bw.mode.step_mode = True
         try:
             pyglet.clock.unschedule(bw.update)
@@ -282,7 +299,9 @@ class NeuralWorkshopEnv(object):
         self._events = []
         self._archive = {}
         self._action_finalized = False
-        self.probe = _TestProbe()
+        self._delivered = set()
+        self._cached_outcome = None
+        self._receipt_ledger = {}
         self.reset(0 if seed is None else seed)
 
     @property
@@ -304,11 +323,13 @@ class NeuralWorkshopEnv(object):
         bw.cfg.SHOW_FEEDBACK = True
         bw.cfg.ANIMATE_SQUARES = False
         bw.mode.hide_text = False
+        self._apply_session_config()
         bw.new_session()
         bw.mode.step_mode = True
         bw.mode.tick = 0
         bw.mode.phase = None
         bw.mode.session_number = 1
+        self._apply_session_config()
         random.seed(seed)
         bwaccel.seed(seed)
         self.accounting.reset()
@@ -321,6 +342,9 @@ class NeuralWorkshopEnv(object):
         self._consumed = True
         self._archive = {}
         self._action_finalized = False
+        self._delivered = set()
+        self._cached_outcome = None
+        self._receipt_ledger = {}
         phase = bw.trial_advance_significant()
         self._publish(phase)
         if phase == 'stimulus':
@@ -329,6 +353,7 @@ class NeuralWorkshopEnv(object):
         return self.observe()
 
     def observe(self):
+        """Return the current frame. Never publishes or re-enqueues events."""
         obs = self._observation()
         self._consumed = True
         self._pending = False
@@ -336,14 +361,19 @@ class NeuralWorkshopEnv(object):
                            self._width, self._height, self._rgba, True)
         return obs
 
-    def act(self, ports=None):
-        """Accept exactly one finalized action per trial (stimulus window)."""
+    def act(self, ports=None, logp=None):
+        """Accept exactly one finalized action per trial (stimulus window).
+
+        ``logp`` is an optional policy log-propensity stored on the receipt
+        so a runtime can map it back to this trial. It is not interpreted here.
+        """
         rejected = {
             'ok': False,
             'receipt_id': None,
             'frame_seq': self._seq,
             'timestamp_ns': _now_ns(),
             'ports': (),
+            'logp': None,
         }
         if not self._response_open or self._trial_receipt is None:
             return rejected
@@ -360,7 +390,10 @@ class NeuralWorkshopEnv(object):
             'frame_seq': self._seq,
             'timestamp_ns': _now_ns(),
             'ports': tuple(indices),
+            'logp': logp,
         }
+        self._receipt_ledger[self._trial_receipt['receipt_id']] = dict(
+            self._trial_receipt)
         return dict(self._trial_receipt)
 
     def advance(self):
@@ -368,7 +401,8 @@ class NeuralWorkshopEnv(object):
             self.accounting.duplicate_frames += 1
             return self.observe()
         if bw.mode.session_done or bw.mode.phase == 'done':
-            self._publish('done')
+            if self._phase != 'done':
+                self._publish('done')
             return self.observe()
         prev = bw.mode.phase
         phase = bw.trial_advance_significant()
@@ -401,6 +435,16 @@ class NeuralWorkshopEnv(object):
                 pass
         self._export.close()
 
+    def _apply_session_config(self):
+        if self._game_mode is not None:
+            bw.mode.mode = int(self._game_mode)
+            bw.cfg.GAME_MODE = int(self._game_mode)
+        if self._num_trials is not None:
+            n = int(self._num_trials)
+            bw.mode.num_trials = n
+            bw.mode.num_trials_factor = 0
+            bw.mode.num_trials_total = n
+
     def _open_trial_window(self):
         self._response_open = True
         self._action_finalized = False
@@ -411,7 +455,9 @@ class NeuralWorkshopEnv(object):
             'frame_seq': self._seq,
             'timestamp_ns': _now_ns(),
             'ports': (),
+            'logp': None,
         }
+        self._receipt_ledger[self._receipt_seq] = dict(self._trial_receipt)
 
     def _decode_ports(self, ports):
         n = self.n_actions
@@ -441,38 +487,16 @@ class NeuralWorkshopEnv(object):
             'rgba': self._rgba,
             'done': self._phase == 'done',
         }
-        if self._phase == 'feedback':
-            outcome = derive_public_outcome(
-                self._rgba, self._width, self._height,
-                self._trial_digests,
-                (self._trial_receipt or {}).get('receipt_id'),
-            )
-            if outcome is not None:
-                obs['outcome'] = outcome
-                ev_key = (
-                    outcome['receipt_id'],
-                    tuple(outcome['evidence_digests']),
-                    outcome['scalar'],
-                )
-                self.accounting.authenticated_outcomes.add(ev_key)
-                if self._trial_receipt:
-                    lat = self._timestamp_ns - self._trial_receipt['timestamp_ns']
-                    self.accounting.action_to_outcome_ns.append(lat)
-                self._events.append({
-                    'type': 'outcome',
-                    'scalar': outcome['scalar'],
-                    'evidence_digests': outcome['evidence_digests'],
-                    'receipt_id': outcome['receipt_id'],
-                    'frame_seq': self._seq,
-                    'timestamp_ns': self._timestamp_ns,
-                })
-        if self._phase == 'done':
-            self._events.append({
-                'type': 'session_end',
-                'frame_seq': self._seq,
-                'timestamp_ns': self._timestamp_ns,
-            })
+        if self._cached_outcome is not None:
+            obs['outcome'] = self._cached_outcome
         return obs
+
+    def _emit_once(self, key, event):
+        if key in self._delivered:
+            return False
+        self._delivered.add(key)
+        self._events.append(event)
+        return True
 
     def _publish(self, phase):
         if self._pending and not self._consumed:
@@ -491,6 +515,53 @@ class NeuralWorkshopEnv(object):
         self._trial_digests.append(self._digest)
         self.accounting.significant_frames += 1
         self._export.write(self._seq, self._timestamp_ns, w, h, rgba, False)
+        self._cached_outcome = None
+        if phase == 'feedback':
+            rid = (self._trial_receipt or {}).get('receipt_id')
+            key = ('outcome', rid)
+            if key not in self._delivered:
+                outcome = derive_public_outcome(
+                    rgba, w, h, self._trial_digests, rid)
+                if outcome is not None:
+                    self._cached_outcome = outcome
+                    ev_key = (
+                        outcome['receipt_id'],
+                        tuple(outcome['evidence_digests']),
+                        outcome['scalar'],
+                    )
+                    self.accounting.authenticated_outcomes.add(ev_key)
+                    emitted = self._emit_once(key, {
+                        'type': 'outcome',
+                        'scalar': outcome['scalar'],
+                        'evidence_digests': outcome['evidence_digests'],
+                        'receipt_id': outcome['receipt_id'],
+                        'frame_seq': self._seq,
+                        'timestamp_ns': self._timestamp_ns,
+                    })
+                    if emitted and self._trial_receipt:
+                        lat = (self._timestamp_ns
+                               - self._trial_receipt['timestamp_ns'])
+                        self.accounting.action_to_outcome_ns.append(lat)
+                else:
+                    self._delivered.add(key)
+        if phase == 'done':
+            self._emit_once(('session_end',), {
+                'type': 'session_end',
+                'frame_seq': self._seq,
+                'timestamp_ns': self._timestamp_ns,
+            })
+
+
+class DiagnosticEnv(NeuralWorkshopEnv):
+    """Test/debug wrapper. Production ``NeuralWorkshopEnv`` has no probe."""
+
+    def __init__(self, seed=None, shm_name=None, game_mode=None,
+                 num_trials=None):
+        os.environ['NW_DIAGNOSTICS'] = '1'
+        super(DiagnosticEnv, self).__init__(
+            seed=seed, shm_name=shm_name, diagnostics=True,
+            game_mode=game_mode, num_trials=num_trials)
+        self.probe = _TestProbe()
 
 
 def make_env(seed=0, shm_name=None):

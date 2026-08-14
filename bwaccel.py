@@ -97,6 +97,83 @@ def count_feedback_pixels(rgba, width, height, y0=None, y1=None):
     return (pos, neg, oops)
 
 
+def count_feedback_label_runs(rgba, width, height, y0=None, y1=None):
+    """Count feedback *labels* in the public pixel band.
+
+    Rule (wording- and resolution-invariant):
+    1. Classify each column in ``[y0, y1)`` by majority feedback color
+       (green / red / blue), requiring at least two matching pixels.
+    2. Merge same-class column-runs separated by fewer than
+       ``max(8, width // 40)`` empty columns. That closes glyph and
+       word gaps inside one caption without joining separate labels.
+    3. Each remaining run is one label. ``scalar`` later uses
+       ``(n_pos - n_neg) / (n_pos + n_neg)``.
+    """
+    width = int(width)
+    height = int(height)
+    if y0 is None:
+        y0 = int(height * 0.75)
+    if y1 is None:
+        y1 = height
+    y0 = max(0, int(y0))
+    y1 = min(height, int(y1))
+    if USING_NATIVE and hasattr(_native, 'count_feedback_label_runs'):
+        return _native.count_feedback_label_runs(bytes(rgba), width, height, y0, y1)
+    raw = rgba
+    rowb = width * 4
+    classes = []
+    for x in range(width):
+        pos = neg = oops = 0
+        for y in range(y0, y1):
+            off = y * rowb + x * 4
+            r, g, b = raw[off], raw[off + 1], raw[off + 2]
+            if g >= 180 and r <= 140 and b <= 140:
+                pos += 1
+            elif r >= 180 and g <= 140 and b <= 140:
+                neg += 1
+            elif b >= 180 and r <= 140 and g <= 140:
+                oops += 1
+        cls = 0
+        if pos >= 2 and pos >= neg and pos >= oops:
+            cls = 1
+        elif neg >= 2 and neg >= oops:
+            cls = 2
+        elif oops >= 2:
+            cls = 3
+        classes.append(cls)
+    return _count_closed_column_runs(classes, width)
+
+
+def _count_closed_column_runs(classes, width):
+    gap_thresh = max(8, int(width) // 40)
+    pos_runs = neg_runs = oops_runs = 0
+    x = 0
+    n = len(classes)
+    while x < n:
+        cls = classes[x]
+        if cls == 0:
+            x += 1
+            continue
+        x += 1
+        while True:
+            while x < n and classes[x] == cls:
+                x += 1
+            z = x
+            while z < n and classes[z] == 0:
+                z += 1
+            if z < n and classes[z] == cls and (z - x) < gap_thresh:
+                x = z
+                continue
+            break
+        if cls == 1:
+            pos_runs += 1
+        elif cls == 2:
+            neg_runs += 1
+        else:
+            oops_runs += 1
+    return (pos_runs, neg_runs, oops_runs)
+
+
 # ---------------------------------------------------------------------------
 # Pure-Python fallbacks
 # ---------------------------------------------------------------------------
