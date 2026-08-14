@@ -1145,15 +1145,63 @@ static PyObject *py_mean_tail(PyObject *self, PyObject *args)
 
 static PyObject *py_seed(PyObject *self, PyObject *args)
 {
-    unsigned long long s = 0;
+    PyObject *obj = NULL;
     (void)self;
-    if (!PyArg_ParseTuple(args, "|K", &s))
+    if (!PyArg_ParseTuple(args, "|O", &obj))
         return NULL;
-    if (s == 0)
+    /* No argument or None → entropy. Explicit 0 is a real seed. */
+    if (obj == NULL || obj == Py_None) {
         pcg32_seed_auto();
-    else
+        Py_RETURN_NONE;
+    }
+    {
+        unsigned long long s = PyLong_AsUnsignedLongLong(obj);
+        if (PyErr_Occurred())
+            return NULL;
         pcg32_seed((uint64_t)s);
+    }
     Py_RETURN_NONE;
+}
+
+static PyObject *py_count_feedback_pixels(PyObject *self, PyObject *args)
+{
+    Py_buffer buf;
+    int w, h, y0, y1;
+    const unsigned char *p;
+    long pos = 0, neg = 0, oops = 0;
+    int y, x;
+
+    (void)self;
+    if (!PyArg_ParseTuple(args, "y*iiii", &buf, &w, &h, &y0, &y1))
+        return NULL;
+    if (w < 1 || h < 1 || buf.len < (Py_ssize_t)w * (Py_ssize_t)h * 4) {
+        PyBuffer_Release(&buf);
+        PyErr_SetString(PyExc_ValueError, "framebuffer size does not match w*h*4");
+        return NULL;
+    }
+    if (y0 < 0)
+        y0 = 0;
+    if (y1 > h)
+        y1 = h;
+    if (y1 < y0)
+        y1 = y0;
+    p = (const unsigned char *)buf.buf;
+    for (y = y0; y < y1; ++y) {
+        const unsigned char *row = p + (Py_ssize_t)y * (Py_ssize_t)w * 4;
+        for (x = 0; x < w; ++x) {
+            unsigned char r = row[x * 4];
+            unsigned char g = row[x * 4 + 1];
+            unsigned char b = row[x * 4 + 2];
+            if (g >= 180 && r <= 140 && b <= 140)
+                ++pos;
+            else if (r >= 180 && g <= 140 && b <= 140)
+                ++neg;
+            else if (b >= 180 && r <= 140 && g <= 140)
+                ++oops;
+        }
+    }
+    PyBuffer_Release(&buf);
+    return Py_BuildValue("(lll)", pos, neg, oops);
 }
 
 static PyObject *py_backend(PyObject *self, PyObject *args)
@@ -1187,7 +1235,9 @@ static PyMethodDef BwcoreMethods[] = {
      "is_nback_match(current, history, nback_trial) -> bool or None"},
     {"mean_tail", py_mean_tail, METH_VARARGS,
      "mean_tail(seq, tail=0) -> float  (tail=0 means the whole sequence)"},
-    {"seed", py_seed, METH_VARARGS, "seed(n=0) — 0 reseeds from entropy"},
+    {"seed", py_seed, METH_VARARGS, "seed() entropy; seed(n) including n=0 is deterministic"},
+    {"count_feedback_pixels", py_count_feedback_pixels, METH_VARARGS,
+     "count_feedback_pixels(rgba, w, h, y0, y1) -> (pos, neg, oops)"},
     {"backend", py_backend, METH_NOARGS, "Return 'C'"},
     {NULL, NULL, 0, NULL}
 };

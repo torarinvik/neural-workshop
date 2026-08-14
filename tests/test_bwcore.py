@@ -284,6 +284,17 @@ class ArithmeticTests(unittest.TestCase):
 
 
 class TimingTests(unittest.TestCase):
+    def test_seed_zero_is_deterministic(self):
+        seqs = []
+        for _ in range(3):
+            bwaccel.seed(0)
+            seqs.append(bwaccel.compute_bt_sequence(24, 2, 6, 6, 2, 8, 8))
+        self.assertEqual(seqs[0], seqs[1])
+        self.assertEqual(seqs[1], seqs[2])
+        bwaccel.seed(1)
+        other = bwaccel.compute_bt_sequence(24, 2, 6, 6, 2, 8, 8)
+        self.assertNotEqual(seqs[0], other)
+
     def test_ms_to_ticks(self):
         self.assertEqual(bwaccel.ms_to_ticks(3000, 100), 30)
         self.assertEqual(bwaccel.ms_to_ticks(50, 1), 50)
@@ -299,6 +310,30 @@ class TimingTests(unittest.TestCase):
         self.assertEqual(bwaccel.interval_adjust_step(10), 1)
         self.assertEqual(bwaccel.interval_adjust_step(80), 5)
         self.assertEqual(bwaccel.interval_adjust_step(3000), 100)
+
+    def test_plan_phases_fits_short_trial(self):
+        plan = bwaccel.plan_trial_phases(10, 500, 200, tick_ms=1)
+        self.assertEqual(plan['total_ticks'], 10)
+        self.assertEqual(
+            plan['stimulus_ticks'] + plan['blank_ticks'] + plan['feedback_ticks'],
+            10)
+        self.assertGreaterEqual(plan['stimulus_ticks'], 1)
+        self.assertGreaterEqual(plan['feedback_ticks'], 1)
+        self.assertEqual(plan['blank_ticks'], 0)
+
+    def test_plan_phases_keeps_blank_when_room(self):
+        plan = bwaccel.plan_trial_phases(3000, 500, 200, tick_ms=100)
+        self.assertEqual(plan['total_ticks'], 30)
+        self.assertEqual(plan['stimulus_ticks'], 5)
+        self.assertEqual(plan['feedback_ticks'], 2)
+        self.assertEqual(plan['blank_ticks'], 23)
+
+    def test_active_cells_default_all(self):
+        ids = bwaccel.active_position_ids(4, False, 0)
+        self.assertEqual(len(ids), 16)
+        subset = bwaccel.active_position_ids(4, False, 8)
+        self.assertEqual(len(subset), 8)
+        self.assertEqual(subset, bwaccel.grid_center_out_ids(4)[:8])
 
 
 class BackendTests(unittest.TestCase):

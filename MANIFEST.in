@@ -1,4 +1,7 @@
 include native/bwcore.c
 include bwaccel.py
+include nwenv.py
 include setup.py
 include tests/test_bwcore.py
+include tests/test_nwenv.py
+include run

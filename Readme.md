@@ -56,16 +56,52 @@ agent training you can set millisecond intervals:
 
 - `--trial-ms N` — length of one cell/trial in milliseconds
 - `--tick-ms N` — scheduler quantum (use `1` for true ms control)
-- `--stim-ms N` — how long the stimulus stays visible
+- `--stim-ms N` — requested stimulus visibility (scaled down if it
+  cannot fit in the trial together with feedback)
 - `--headless` — skip the title screen, hide the window, mute music,
   default to a 1 ms clock and 10 ms trials (override with `--trial-ms`)
 
-In game: **C** → *Trial interval (ms)*, or **F5** / **F6** in Manual mode.
-Config keys: `TRIAL_INTERVAL_MS`, `TICK_DURATION_MS`, `STIMULUS_DURATION_MS`,
-`FEEDBACK_DURATION_MS`, `HEADLESS`.
+Trials are a **state machine** (`stimulus` → optional `blank` →
+`feedback`). If `stimulus + feedback > trial`, both phases are scaled
+so they stay non-overlapping and still fit.
 
-The window buffer is still drawn each frame in headless mode so you can
-capture it for an agent; a dedicated frame-export hook can be added next.
+In game: **C** → *Trial interval (ms)*, or **F5** / **F6** in Manual mode.
+
+### Agent environment
+
+`nwenv.NeuralWorkshopEnv` is a `reset → observe → act → advance` boundary
+that shares the human game's stimulus, input, scoring, and renderer.
+
+```python
+from nwenv import NeuralWorkshopEnv
+env = NeuralWorkshopEnv(seed=1)
+obs = env.reset(1)            # RGBA + frame_seq + timestamp
+receipt = env.act(0)                    # opaque port index, not a modality name
+obs, events, done = env.step([])        # waits until the last frame was consumed
+env.close()
+```
+
+- Each `advance`/`step` emits the next **significant** frame (stimulus,
+  blank, or feedback) and will not move on until that frame is consumed.
+- Observations never include cell IDs, match labels, scores, phase
+  names, or the sequence. Outcomes are a pixel-derived scalar plus
+  SHA-256 digests of the public frames used as evidence and the
+  trial's action receipt. Missing/ambiguous feedback yields *no*
+  outcome (not a zero reward).
+- Actions are opaque integer port indices (`act(0)`, `act([0, 1])`).
+- `NW_SHM=name` writes a one-way framebuffer dump (header + RGBA).
+  It is **not** a complete IPC protocol (no seqlock, no action or
+  reset channel, no ownership handshake).
+
+Benchmark (reports trials/s, never “experiences/s”):
+
+```
+.venv/bin/python nwenv.py
+```
+
+`GRID_SIZE` is the visible board. `ACTIVE_POSITION_CELLS` (0 = all) is
+an independent center-out curriculum. The session panel shows
+`Grid 4×4 (8/16 cells)` when a subset is active.
 
 ### Grid size
 

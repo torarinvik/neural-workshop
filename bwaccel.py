@@ -21,7 +21,8 @@ apply_arithmetic(op, a, b)  Decimal add/sub/mul/div (no eval)
 score_arithmetic(...)       rights/wrongs for an arithmetic session
 banner()                    'native: C' / 'native: Python'
 grid_layout / grid_cell_count / position_col_row
-ms_to_ticks / clamp_trial_interval_ms
+ms_to_ticks / clamp_trial_interval_ms / plan_trial_phases
+active_position_ids
 seed(n=0)
 """
 from __future__ import print_function
@@ -53,14 +54,47 @@ def banner():
     return 'native: %s' % backend()
 
 
-def seed(n=0):
+def seed(n=None):
+    """Seed RNGs. ``None`` (or omitted) uses entropy. ``0`` is a real seed."""
     if USING_NATIVE:
-        _native.seed(n)
+        if n is None:
+            _native.seed()
+        else:
+            _native.seed(int(n))
         return
-    if n:
-        random.seed(n)
-    else:
+    if n is None:
         random.seed()
+    else:
+        random.seed(int(n))
+
+
+def count_feedback_pixels(rgba, width, height, y0=None, y1=None):
+    """Count public feedback-palette pixels in [y0, y1) of a top-down RGBA buffer."""
+    width = int(width)
+    height = int(height)
+    if y0 is None:
+        y0 = int(height * 0.75)
+    if y1 is None:
+        y1 = height
+    y0 = max(0, int(y0))
+    y1 = min(height, int(y1))
+    if USING_NATIVE and hasattr(_native, 'count_feedback_pixels'):
+        return _native.count_feedback_pixels(bytes(rgba), width, height, y0, y1)
+    pos = neg = oops = 0
+    raw = rgba
+    rowb = width * 4
+    for y in range(y0, y1):
+        base = y * rowb
+        for x in range(width):
+            off = base + x * 4
+            r, g, b = raw[off], raw[off + 1], raw[off + 2]
+            if g >= 180 and r <= 140 and b <= 140:
+                pos += 1
+            elif r >= 180 and g <= 140 and b <= 140:
+                neg += 1
+            elif b >= 180 and r <= 140 and g <= 140:
+                oops += 1
+    return (pos, neg, oops)
 
 
 # ---------------------------------------------------------------------------
@@ -512,6 +546,52 @@ def clamp_trial_interval_ms(ms, tick_ms=100, min_ticks=3, max_ms=60000):
     # Snap to the scheduler quantum so ticks * tick_ms == interval.
     ticks = ms_to_ticks(ms, tick_ms)
     return ticks * tick_ms
+
+
+def active_position_ids(n, include_center=False, limit=0):
+    """IDs that may be sampled. ``limit<=0`` means the full board.
+
+    A positive limit takes the first N cells in center-out curriculum order.
+    """
+    all_ids = [pid for pid, _c, _r in grid_layout(n, include_center)]
+    try:
+        limit = int(limit or 0)
+    except (TypeError, ValueError):
+        limit = 0
+    if limit <= 0 or limit >= len(all_ids):
+        return all_ids
+    order = grid_center_out_ids(n, include_center)
+    return order[:max(2, min(limit, len(order)))]
+
+
+def plan_trial_phases(trial_ms, stim_ms, feedback_ms, tick_ms=1):
+    """Non-overlapping stimulus / blank / feedback ticks for one trial.
+
+    If stim + feedback would exceed the trial, both are scaled down
+    proportionally so each gets at least one tick and they sum to the trial.
+    """
+    tick_ms = max(1, int(tick_ms))
+    total = max(3, ms_to_ticks(trial_ms, tick_ms))
+    stim_want = max(1, ms_to_ticks(stim_ms, tick_ms))
+    fb_want = max(1, ms_to_ticks(feedback_ms, tick_ms))
+    if stim_want + fb_want > total:
+        stim = int(round(total * (stim_want / float(stim_want + fb_want))))
+        stim = max(1, min(stim, total - 1))
+        fb = total - stim
+        blank = 0
+    else:
+        stim = stim_want
+        fb = fb_want
+        blank = total - stim - fb
+    return {
+        'total_ticks': total,
+        'stimulus_ticks': int(stim),
+        'blank_ticks': int(blank),
+        'feedback_ticks': int(fb),
+        'stimulus_ms': int(stim) * tick_ms,
+        'blank_ms': int(blank) * tick_ms,
+        'feedback_ms': int(fb) * tick_ms,
+    }
 
 
 def interval_adjust_step(ms):

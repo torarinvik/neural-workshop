@@ -58,6 +58,16 @@ from decimal import Decimal, InvalidOperation
 from time import strftime
 from datetime import date
 import gettext
+import pyglet
+if '--headless' in sys.argv or os.environ.get('NW_HEADLESS', '').lower() in (
+        '1', 'true', 'yes'):
+    # pyglet's "headless" backend needs EGL/OSMesa (Linux). On macOS/Windows
+    # we keep the native window and hide it so GL readback still works.
+    if sys.platform.startswith('linux'):
+        try:
+            pyglet.options['headless'] = True
+        except Exception:
+            pass
 from pyglet.shapes import Line
 from pyglet.shapes import Polygon
 
@@ -149,7 +159,9 @@ def main_is_frozen():
 def get_main_dir():
     if main_is_frozen():
         return os.path.dirname(sys.executable)
-    return sys.path[0]
+    # Resolve against this file, not sys.path[0] (broken under
+    # `python -m unittest discover -s tests`).
+    return os.path.dirname(os.path.abspath(__file__))
 
 def get_settings_path(name):
     '''Get a directory to save user preferences.
@@ -177,6 +189,12 @@ def get_res_dir():
         return rtrn
     else:
         return os.path.join(get_main_dir(), FOLDER_RES)
+
+
+def load_pyglet_image(path):
+    """Load an image and close the file handle (avoids ResourceWarning)."""
+    with open(path, 'rb') as fh:
+        return pyglet.image.load(filename=path, file=fh)
 def edit_config_ini():
     if sys.platform == 'win32':
         cmd = 'notepad'
@@ -333,11 +351,11 @@ GRID_INCLUDE_CENTER = False
 # Default: [1, 3, 8, 6]
 VISUAL_COLORS = [1, 3, 8, 6]
 
-# Position N-Back curriculum: number of publicly visible grid cells sampled.
-# Cells are introduced center-out in the order left/right, up/down, corners.
-# This changes only the human-visible stimulus distribution; scoring and rules
-# remain ordinary Position N-Back.
-POSITION_CELL_COUNT = int(os.environ.get('BRAINWORKSHOP_POSITION_CELLS', '8'))
+# Visible board size is GRID_SIZE. ACTIVE_POSITION_CELLS is an optional
+# curriculum subset (center-out). 0 = use every cell on the board.
+# POSITION_CELL_COUNT is kept as a legacy alias.
+ACTIVE_POSITION_CELLS = int(os.environ.get('NW_ACTIVE_CELLS', '0'))
+POSITION_CELL_COUNT = int(os.environ.get('BRAINWORKSHOP_POSITION_CELLS', '0'))
 
 # Specify image sets here. This is a list of subfolders in the res/sprites/
 # folder which may be selected in Image mode.
@@ -958,16 +976,36 @@ def apply_trial_interval_override():
         set_trial_interval_ms(ms)
 
 
-def stimulus_hide_tick():
-    positions = len([mod for mod in mode.modalities[mode.mode] if mod.startswith('position')])
-    positions = max(0, positions - 1)
-    hide = bwaccel.ms_to_ticks(cfg.STIMULUS_DURATION_MS, tick_duration_ms()) + positions
-    return min(hide, max(2, mode.ticks_per_trial - 1))
+def current_active_cell_limit():
+    """0 means the full grid. Positive = center-out curriculum cap."""
+    for key in ('ACTIVE_POSITION_CELLS', 'POSITION_CELL_COUNT'):
+        try:
+            n = int(cfg[key] or 0)
+        except Exception:
+            n = 0
+        if n > 0:
+            return n
+    return 0
+
+
+def current_active_position_ids():
+    return bwaccel.active_position_ids(
+        current_grid_size(), current_include_center(),
+        current_active_cell_limit())
+
+
+def plan_current_trial_phases():
+    return bwaccel.plan_trial_phases(
+        trial_interval_ms(),
+        cfg.STIMULUS_DURATION_MS,
+        cfg.FEEDBACK_DURATION_MS,
+        tick_duration_ms())
 
 
 def feedback_tick():
-    fb = bwaccel.ms_to_ticks(cfg.FEEDBACK_DURATION_MS, tick_duration_ms())
-    return max(2, mode.ticks_per_trial - fb)
+    """Tick index (from trial start) where feedback begins. Used by self-paced."""
+    plan = plan_current_trial_phases()
+    return plan['stimulus_ticks'] + plan['blank_ticks'] + 1
 
 if CLINICAL_MODE:
     cfg.JAEGGI_INTERFACE_DEFAULT_SCORING = False
@@ -1273,7 +1311,7 @@ else:
 if sys.platform == 'darwin' and cfg.WINDOW_FULLSCREEN:
     window.set_exclusive_keyboard()
 if sys.platform == 'linux2':
-    window.set_icon(pyglet.image.load(resourcepaths['misc']['brain'][0]))
+    window.set_icon(load_pyglet_image(resourcepaths['misc']['brain'][0]))
 
 # set the background color of the window
 if cfg.BLACK_BACKGROUND:
@@ -1508,6 +1546,11 @@ class Mode:
         self.trial_number = 0
         self.tick = 0
         self.progress = 0
+        self.phase = None
+        self.phase_elapsed = 0
+        self.step_mode = False
+        self.frame_seq = 0
+        self.session_done = False
 
         self.sound_mode = 'none'
         self.sound2_mode = 'none'
@@ -2095,6 +2138,12 @@ class PercentCycler(Cycler):
         else:
             return "%2.1f%%"   % (v*100.)
 
+
+class AllCycler(Cycler):
+    def __str__(self):
+        v = self.value()
+        return 'all' if v == 0 else str(v)
+
 class Menu:
     """
     Menu.__init__(self, options, values={}, actions={}, names={}, title='',  choose_once=False,
@@ -2362,12 +2411,13 @@ class GameSelect(Menu):
         names = dict([(m, _("Use %s") % m) for m in modalities])
         names['position1'] = _("Use position")
         options.extend(["Blank line", 'combination', "Blank line", 'variable',
-            'crab', "Blank line", 'grid', 'trial_ms', 'Blank line',
+            'crab', "Blank line", 'grid', 'active_cells', 'trial_ms', 'Blank line',
             'multi', 'multimode', 'Blank line',
             'selfpaced', "Blank line", 'interference'])
         names['combination'] = _('Combination N-back mode')
         names['variable'] = _('Use variable N-Back levels')
         names['grid'] = _('Grid size')
+        names['active_cells'] = _('Active position cells')
         names['trial_ms'] = _('Trial interval (ms)')
         names['crab'] = _('Crab-back mode (reverse order of sets of N stimuli)')
         names['multi'] = _('Simultaneous visual stimuli')
@@ -2410,6 +2460,20 @@ class GameSelect(Menu):
         except ValueError:
             trial_ms_default = trial_ms_values.index(3000) if 3000 in trial_ms_values else 0
         vals['trial_ms'] = Cycler(values=trial_ms_values, default=trial_ms_default)
+        cell_values = [0, 2, 3, 4, 6, 8, 12, 16, 24, 32, 64]
+        ncells = current_cell_count()
+        if ncells not in cell_values:
+            cell_values.append(ncells)
+            cell_values.sort()
+        cur_cells = current_active_cell_limit()
+        if cur_cells not in cell_values:
+            cell_values.append(cur_cells)
+            cell_values.sort()
+        try:
+            cells_default = cell_values.index(cur_cells)
+        except ValueError:
+            cells_default = 0
+        vals['active_cells'] = AllCycler(values=cell_values, default=cells_default)
         for m in modalities:
             vals[m] = m in curmodes
         Menu.__init__(self, options, vals, names=names, title=_('Choose your game mode'))
@@ -2480,6 +2544,8 @@ class GameSelect(Menu):
         for visual in visuals:
             visual.sync_size()
         set_trial_interval_ms(int(self.values['trial_ms'].value()))
+        cfg.ACTIVE_POSITION_CELLS = int(self.values['active_cells'].value())
+        cfg.POSITION_CELL_COUNT = cfg.ACTIVE_POSITION_CELLS
         if self.newmode:
             mode.mode = self.newmode
 
@@ -2793,7 +2859,7 @@ class Visual:
             font_size=field.size//6, weight='bold',
             anchor_x='center', anchor_y='center', batch=batch)
 
-        self.spr_square = [pyglet.sprite.Sprite(pyglet.image.load(path))
+        self.spr_square = [pyglet.sprite.Sprite(load_pyglet_image(path))
                               for path in resourcepaths['misc']['colored-squares']]
         self.spr_square_size = self.spr_square[0].width
 
@@ -2823,7 +2889,7 @@ class Visual:
         if hasattr(self, 'image_set_index') and index == self.image_set_index:
             return
         self.image_set_index = index
-        self.image_set = [pyglet.sprite.Sprite(pyglet.image.load(path))
+        self.image_set = [pyglet.sprite.Sprite(load_pyglet_image(path))
                             for path in resourcepaths['sprites'][index]]
         self.image_set_size = self.image_set[0].width
 
@@ -3083,8 +3149,10 @@ class GameModeLabel:
             str_list.append(str(mode.back))
             str_list.append(_('-Back'))
             if mode.mode == 10:
-                str_list.append(_(' (%i cells, %i trials)') %
-                                (cfg.POSITION_CELL_COUNT, mode.num_trials_total))
+                n_active = len(current_active_position_ids())
+                n_total = current_cell_count()
+                str_list.append(_(' (%i/%i cells, %i trials)') %
+                                (n_active, n_total, mode.num_trials_total))
             self.label.text = ''.join(str_list)
 
     def flash(self):
@@ -3521,10 +3589,16 @@ class SessionInfoLabel:
             else:
                 timing = _('%1.2f sec/trial') % (ms / 1000.0)
             session_s = int((ms / 1000.0) * mode.num_trials_total)
-            self.label.text = _('Session:\n%s\n%i+%i trials\n%i seconds\nGrid %i×%i') % \
+            ncells = current_cell_count()
+            active = current_active_position_ids()
+            if len(active) < ncells:
+                gridline = _('Grid %i×%i (%i/%i cells)') % (n, n, len(active), ncells)
+            else:
+                gridline = _('Grid %i×%i') % (n, n)
+            self.label.text = _('Session:\n%s\n%i+%i trials\n%i seconds\n%s') % \
                               (timing, mode.num_trials,
                                mode.num_trials_total - mode.num_trials,
-                               session_s, n, n)
+                               session_s, gridline)
     def flash(self):
         pyglet.clock.unschedule(sessionInfoLabel.unflash)
         self.label.weight='bold'
@@ -3578,8 +3652,10 @@ class SpaceLabel:
             str_list.append(str(mode.back))
             str_list.append(_('-Back'))
             if mode.mode == 10:
-                str_list.append(_(' (%i cells, %i trials)') %
-                                (cfg.POSITION_CELL_COUNT, mode.num_trials_total))
+                n_active = len(current_active_position_ids())
+                n_total = current_cell_count()
+                str_list.append(_(' (%i/%i cells, %i trials)') %
+                                (n_active, n_total, mode.num_trials_total))
             self.label.text = ''.join(str_list)
 
 def check_match(input_type, check_missed = False):
@@ -4297,6 +4373,11 @@ def new_session():
     mode.tick -= 5 * (mode.flags[mode.mode]['multi'] - 1 )
     if cfg.MULTI_MODE == 'image':
         mode.tick -= 5 * (mode.flags[mode.mode]['multi'] - 1 )
+    mode.phase = None
+    mode.phase_elapsed = 0
+    mode.session_done = False
+    if mode.step_mode:
+        mode.tick = 0
 
     mode.session_number += 1
     mode.trial_number = 0
@@ -4354,6 +4435,8 @@ def end_session(cancelled=False):
     for visual in visuals: visual.hide()
     mode.started = False
     mode.paused = False
+    mode.phase = 'done'
+    mode.session_done = not cancelled
     circles.update()
     field.crosshair_update()
     reset_input()
@@ -4404,28 +4487,24 @@ def reset_input():
 def compute_bt_sequence():
     # Constructive generator in C (O(trials)); the old nested rejection
     # sampler could stall for minutes at high n-back (trials ≈ 20 + n²).
-    mode.bt_sequence = bwaccel.compute_bt_sequence(
+    npos = len(current_active_position_ids())
+    raw = bwaccel.compute_bt_sequence(
         mode.num_trials_total, mode.back, 6, 6, 2,
-        current_cell_count(), 8)
+        npos, 8)
+    ids = current_active_position_ids()
+    mode.bt_sequence = [[ids[i - 1] for i in raw[0]], raw[1]]
 
 player = get_pyglet_media_Player()
 player2 = get_pyglet_media_Player()
 # responsible for the random generation of each new stimulus (audio, color, position)
 def generate_stimulus():
     # first, randomly generate all stimuli
-    ncells = current_cell_count()
-    k_multi = min(4, ncells)
-    positions = bwaccel.sample_unique(1, ncells, k_multi)
+    active_ids = current_active_position_ids()
+    k_multi = min(4, len(active_ids))
+    positions = random.sample(active_ids, k_multi)
     for s, p in zip(range(1, k_multi + 1), positions):
         mode.current_stim['position' + repr(s)] = p
         mode.current_stim['vis' + repr(s)] = random.randint(1, 8)
-
-    position_cell_order = bwaccel.grid_center_out_ids(
-        current_grid_size(), current_include_center())
-    cell_cap = min(max(2, int(cfg.POSITION_CELL_COUNT)), len(position_cell_order))
-    if mode.mode == 10:
-        active_position_cells = position_cell_order[:cell_cap]
-        mode.current_stim['position1'] = random.choice(active_position_cells)
 
     mode.current_stim['color']  = random.randint(1, 8)
     mode.current_stim['vis']    = random.randint(1, 8)
@@ -4934,7 +5013,8 @@ def on_key_press(symbol, modifiers):
                         update_input_labels()
 
         if symbol == cfg.KEY_ADVANCE and mode.flags[mode.mode]['selfpaced']:
-            mode.tick = feedback_tick()
+            if mode.phase in ('stimulus', 'blank', None):
+                _enter_feedback_phase()
 
     return pyglet.event.EVENT_HANDLED
 # the loop where everything is drawn on the screen.
@@ -4960,38 +5040,140 @@ def on_draw():
     for label in input_labels:
         label.draw()
 
-# Session timer. Period is cfg.TICK_DURATION_MS (default 100 ms; 1 ms for
-# high-throughput / headless training). Trial length is TRIAL_INTERVAL_MS.
-# tick = 1: save last trial, spawn the next stimulus.
-# hide tick: square disappears (STIMULUS_DURATION_MS).
-# feedback tick: missed-match flash, then wrap to the next trial.
-def update(dt):
-    if mode.started and not mode.paused: # only run the timer during a game
-        hide_at = stimulus_hide_tick()
-        if (not mode.flags[mode.mode]['selfpaced'] or
-                mode.tick > mode.ticks_per_trial - hide_at or
-                mode.tick < hide_at):
+def _begin_stimulus_phase():
+    """Start (or restart) a trial's visible stimulus. Returns 'done' or 'stimulus'."""
+    mode.show_missed = False
+    if mode.trial_number > 0:
+        stats.save_input()
+    mode.trial_number += 1
+    mode.trial_starttime = time.time()
+    trialsRemainingLabel.update()
+    if mode.trial_number > mode.num_trials_total:
+        end_session()
+        mode.phase = 'done'
+        mode.session_done = True
+        return 'done'
+    generate_stimulus()
+    reset_input()
+    mode.phase = 'stimulus'
+    mode.phase_elapsed = 0
+    mode.tick = 1
+    mode.session_done = False
+    return 'stimulus'
+
+
+def _enter_blank_phase():
+    for visual in visuals:
+        visual.hide()
+    mode.phase = 'blank'
+    mode.phase_elapsed = 0
+    return 'blank'
+
+
+def _enter_feedback_phase():
+    for visual in visuals:
+        visual.hide()
+    mode.show_missed = True
+    update_input_labels()
+    mode.phase = 'feedback'
+    mode.phase_elapsed = 0
+    return 'feedback'
+
+
+def trial_tick():
+    """Advance one scheduler tick of the phase machine.
+
+    Returns the new phase name if a *significant* visual change occurred
+    (stimulus / blank / feedback / done), otherwise None.
+    """
+    if not mode.started or mode.paused:
+        return None
+    plan = plan_current_trial_phases()
+    mode.ticks_per_trial = plan['total_ticks']
+
+    if mode.phase == 'done':
+        return None
+    if mode.phase is None:
+        if (not mode.step_mode) and mode.tick < 0:
             mode.tick += 1
-        if mode.tick == 1:
-            mode.show_missed = False
-            if mode.trial_number > 0:
-                stats.save_input()
-            mode.trial_number += 1
-            mode.trial_starttime = time.time()
-            trialsRemainingLabel.update()
-            if mode.trial_number > mode.num_trials_total:
-                end_session()
-            else: generate_stimulus()
-            reset_input()
-        if mode.tick >= hide_at and mode.tick > 1:
-            for visual in visuals: visual.hide()
-        fb_at = feedback_tick()
-        if mode.tick >= fb_at and mode.tick > 1:
-            mode.tick = 0
-            mode.show_missed = True
-            update_input_labels()
-        if mode.tick == mode.ticks_per_trial:
-            mode.tick = 0
+            if mode.tick < 1:
+                return None
+        return _begin_stimulus_phase()
+
+    # Self-paced: freeze during the mid-trial blank unless the user advances.
+    if (mode.flags[mode.mode]['selfpaced'] and mode.phase == 'blank'
+            and mode.phase_elapsed >= 1):
+        return None
+
+    mode.phase_elapsed += 1
+    mode.tick += 1
+    changed = None
+    if mode.phase == 'stimulus' and mode.phase_elapsed >= plan['stimulus_ticks']:
+        if plan['blank_ticks'] > 0:
+            changed = _enter_blank_phase()
+        else:
+            changed = _enter_feedback_phase()
+    elif mode.phase == 'blank' and mode.phase_elapsed >= plan['blank_ticks']:
+        changed = _enter_feedback_phase()
+    elif mode.phase == 'feedback' and mode.phase_elapsed >= plan['feedback_ticks']:
+        changed = _begin_stimulus_phase()
+    return changed
+
+
+def trial_advance_significant():
+    """Run ticks until the visual phase changes (or the session ends)."""
+    first = trial_tick()
+    if first:
+        return first
+    guard = 0
+    while guard < 100000:
+        changed = trial_tick()
+        if changed:
+            return changed
+        guard += 1
+    return mode.phase
+
+
+def response_window_open():
+    """True only while a trial is showing its stimulus (valid action window)."""
+    return bool(mode.started and mode.phase == 'stimulus')
+
+
+def inject_match_action(buttons, now=None):
+    """Apply opaque match-button intentions through the human input path.
+
+    ``buttons`` is an iterable of modality names (e.g. ``'position1'``).
+    Unknown or disallowed names are ignored. Does not reveal correctness.
+    """
+    if now is None:
+        now = time.time()
+    allowed = [m for m in mode.modalities[mode.mode] if m != 'arithmetic']
+    pressed = []
+    if isinstance(buttons, dict):
+        names = [k for k, v in buttons.items() if v]
+    else:
+        names = list(buttons)
+    start = getattr(mode, 'trial_starttime', now)
+    for name in names:
+        if name in allowed:
+            mode.inputs[name] = True
+            mode.input_rts[name] = max(0.0, now - start)
+            pressed.append(name)
+    if pressed:
+        update_input_labels()
+    return tuple(pressed)
+
+
+def action_button_names():
+    return [m for m in mode.modalities[mode.mode] if m != 'arithmetic']
+
+
+# Session timer. Period is cfg.TICK_DURATION_MS. Phases are planned so
+# stimulus + blank + feedback never overlap and always fit the trial.
+def update(dt):
+    if mode.step_mode:
+        return
+    trial_tick()
 pyglet.clock.schedule_interval(update, TICK_DURATION)
 
 angle = 0
@@ -5075,16 +5257,16 @@ apply_trial_interval_override()
 update_all_labels()
 
 # Initialize brain sprite
-brain_icon = pyglet.sprite.Sprite(pyglet.image.load(random.choice(resourcepaths['misc']['brain'])))
+brain_icon = pyglet.sprite.Sprite(load_pyglet_image(random.choice(resourcepaths['misc']['brain'])))
 pos = (field.center_x - brain_icon.width//2,
        field.center_y - brain_icon.height//2,
        0)
 brain_icon.position = pos
 
 if cfg.BLACK_BACKGROUND:
-    brain_graphic = pyglet.sprite.Sprite(pyglet.image.load(random.choice(resourcepaths['misc']['splash-black'])))
+    brain_graphic = pyglet.sprite.Sprite(load_pyglet_image(random.choice(resourcepaths['misc']['splash-black'])))
 else:
-    brain_graphic = pyglet.sprite.Sprite(pyglet.image.load(random.choice(resourcepaths['misc']['splash'])))
+    brain_graphic = pyglet.sprite.Sprite(load_pyglet_image(random.choice(resourcepaths['misc']['splash'])))
 pos = (field.center_x - brain_graphic.width//2,
        field.center_y - brain_graphic.height//2 + 40,
        0)
