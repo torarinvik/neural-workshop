@@ -63,6 +63,8 @@ if '--headless' in sys.argv or os.environ.get('NW_HEADLESS', '').lower() in (
         '1', 'true', 'yes'):
     # pyglet's "headless" backend needs EGL/OSMesa (Linux). On macOS/Windows
     # we keep the native window and hide it so GL readback still works.
+    # Silent audio must be selected before pyglet.media starts OpenAL.
+    pyglet.options['audio'] = ('silent',)
     if sys.platform.startswith('linux'):
         try:
             pyglet.options['headless'] = True
@@ -145,7 +147,68 @@ def calc_fontsize(size):
 def calc_dpi(size = 100):
     return int(size * ((window.width + window.height)/(DEFAULT_WINDOW_WIDTH + DEFAULT_WINDOW_HEIGHT)))
 
+class CapturePlayer(object):
+    """Headless player: record PCM, never open an OpenAL source."""
+
+    def __init__(self):
+        self.volume = 0.0
+        self.min_distance = 1.0
+        self.position = (0.0, 0.0, 0.0)
+        self._queue = []
+        self.playing = False
+
+    def queue(self, source):
+        rec = _capture_source_pcm(source)
+        self._queue.append(rec)
+        audio_capture.append(rec)
+
+    def play(self):
+        self.playing = True
+
+    def pause(self):
+        self.playing = False
+
+    def next_source(self):
+        if self._queue:
+            self._queue.pop(0)
+
+
+audio_capture = []
+
+
+def _capture_source_pcm(source):
+    rec = {
+        'duration': getattr(source, 'duration', None),
+        'audio_format': getattr(source, 'audio_format', None),
+        'pcm': b'',
+    }
+    data = getattr(source, '_data', None)
+    if isinstance(data, (bytes, bytearray, memoryview)):
+        rec['pcm'] = bytes(data)
+        return rec
+    getter = getattr(source, 'get_queue_source', None)
+    src = getter() if callable(getter) else source
+    pull = getattr(src, 'get_audio_data', None)
+    if not callable(pull):
+        return rec
+    chunks = []
+    try:
+        while True:
+            packet = pull(65536)
+            if packet is None:
+                break
+            chunk = getattr(packet, 'data', None)
+            if chunk:
+                chunks.append(bytes(chunk))
+    except Exception:
+        pass
+    rec['pcm'] = b''.join(chunks)
+    return rec
+
+
 def get_pyglet_media_Player():
+    if HEADLESS:
+        return CapturePlayer()
     try:
         my_player = pyglet.media.Player()
     except Exception as e:
@@ -1096,7 +1159,7 @@ except Exception as e:
 
 audio_driver = pyglet.media.get_audio_driver()
 debug_msg("Loaded audio driver=" + audio_driver.__class__.__name__)
-if audio_driver.__class__.__name__ == "SilentDriver":
+if audio_driver.__class__.__name__ == "SilentDriver" and not HEADLESS:
     quit_with_error(_('No suitable audio driver could be loaded.'))
 
 # Initialize resources (sounds and images)
@@ -4387,6 +4450,7 @@ def new_session():
 
     mode.sound_mode  = random.choice(cfg.AUDIO1_SETS)
     mode.sound2_mode = random.choice(cfg.AUDIO2_SETS)
+    audio_capture[:] = []
 
     visuals[0].load_set()
     visuals[0].choose_random_images(8)

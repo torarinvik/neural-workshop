@@ -88,10 +88,19 @@ env.close()
   SHA-256 digests of the public frames used as evidence and the
   trial's action receipt. Missing/ambiguous feedback yields *no*
   outcome (not a zero reward).
+- `verify_public_outcome` requires both the immutable frame archive and
+  the receipt ledger whenever the outcome names a receipt. Omitting
+  either fails closed. `verify_public_pixels` is diagnostic only.
 - Actions are opaque integer port indices (`act(0)`, `act([0, 1])`).
+- Headless / `NW_HEADLESS=1` uses pyglet's silent audio driver and a
+  capture player (PCM is recorded, OpenAL is not started). Dual N-Back
+  audio for training is the captured buffer, not physical playback.
 - `NW_SHM=name` writes a one-way framebuffer dump (header + RGBA).
   It is **not** a complete IPC protocol (no seqlock, no action or
   reset channel, no ownership handshake).
+- Parity tests compare the step driver to the scheduled `update()`
+  clock with the window **hidden**. That is stepped-versus-scheduled
+  parity, not literal visible-window execution.
 
 Benchmark (reports trials/s, never “experiences/s”):
 

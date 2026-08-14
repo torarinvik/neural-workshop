@@ -5,6 +5,7 @@ from __future__ import print_function
 import os
 import random
 import sys
+import threading
 import unittest
 import warnings
 
@@ -25,7 +26,7 @@ try:
     from nwenv import (
         DiagnosticEnv, NeuralWorkshopEnv, diagnose_public_outcome,
         derive_public_outcome, digest_rgba, render_significant_frame,
-        verify_public_outcome,
+        verify_public_outcome, verify_public_pixels,
     )
     _ENV_IMPORT_ERROR = None
 except Exception as exc:
@@ -116,17 +117,20 @@ class CaptureAndPhaseTests(unittest.TestCase):
         outcome = derive_public_outcome(rgba, w, h, [real_d], 1)
         self.assertIsNotNone(outcome)
         self.assertEqual(outcome['scalar'], 1.0)
-        self.assertTrue(verify_public_outcome(outcome, rgba, w, h, archive))
+        self.assertTrue(verify_public_pixels(outcome, rgba, w, h, archive))
+        self.assertFalse(
+            verify_public_outcome(outcome, rgba, w, h, archive=archive),
+            'public verifier requires a receipt ledger')
         forged = dict(outcome)
         forged['evidence_digests'] = ['forged']
-        self.assertFalse(verify_public_outcome(forged, rgba, w, h, archive))
+        self.assertFalse(verify_public_pixels(forged, rgba, w, h, archive))
         earlier = dict(outcome)
         earlier['evidence_digests'] = ['forged-stim', real_d]
         self.assertFalse(
-            verify_public_outcome(earlier, rgba, w, h, archive=None),
+            verify_public_pixels(earlier, rgba, w, h, archive=None),
             'multi-frame evidence requires an archive')
         self.assertFalse(
-            verify_public_outcome(earlier, rgba, w, h, archive=archive))
+            verify_public_pixels(earlier, rgba, w, h, archive=archive))
 
     def test_public_observation_schema(self):
         obs = self.env.reset(1)
@@ -213,6 +217,30 @@ class ProductionEnvTests(unittest.TestCase):
         finally:
             env.close()
 
+    def test_headless_terminates_without_audio_thread_exceptions(self):
+        caught = []
+
+        def hook(args):
+            caught.append(args)
+
+        prev = threading.excepthook
+        threading.excepthook = hook
+        env = DiagnosticEnv(seed=4, game_mode=2, num_trials=4)
+        try:
+            done = False
+            for _ in range(40):
+                _obs, _ev, done = env.step([])
+                if done:
+                    break
+            self.assertTrue(done)
+            driver = __import__('pyglet').media.get_audio_driver()
+            self.assertEqual(driver.__class__.__name__, 'SilentDriver')
+            self.assertTrue(isinstance(bw.player, bw.CapturePlayer))
+            self.assertEqual(caught, [], 'OpenAL/audio worker raised: %s' % caught)
+        finally:
+            threading.excepthook = prev
+            env.close()
+
     def test_act_stores_logp_on_receipt(self):
         env = DiagnosticEnv(seed=3)
         try:
@@ -271,7 +299,8 @@ class ReceiptAndOutcomeTests(unittest.TestCase):
                 found = out
                 self.assertTrue(verify_public_outcome(
                     out, cur['rgba'], cur['width'], cur['height'],
-                    self.env._archive))
+                    archive=self.env._archive,
+                    receipt_ledger=self.env._receipt_ledger))
                 break
             if self.env.probe.session_done():
                 break
@@ -397,7 +426,7 @@ class ReceiptAndOutcomeTests(unittest.TestCase):
         shuffled = dict(real)
         shuffled['scalar'] = -1.0
         archive = {d: rgba}
-        self.assertFalse(verify_public_outcome(shuffled, rgba, w, h, archive))
+        self.assertFalse(verify_public_pixels(shuffled, rgba, w, h, archive))
 
     def test_action_shuffled_receipt_fails_verify(self):
         self.env.reset(15)
@@ -454,10 +483,46 @@ class ReceiptAndOutcomeTests(unittest.TestCase):
             archive=env._archive, receipt_ledger=env._receipt_ledger))
         swapped = dict(b['outcome'])
         swapped['receipt_id'] = a['outcome']['receipt_id']
+        self.assertTrue(
+            verify_public_pixels(
+                swapped, b['rgba'], b['width'], b['height'],
+                archive=env._archive),
+            'pixel-only diagnostic still accepts a swapped receipt')
+        self.assertFalse(
+            verify_public_outcome(
+                swapped, b['rgba'], b['width'], b['height'],
+                archive=env._archive),
+            'public verifier fails closed without a ledger')
         self.assertFalse(verify_public_outcome(
             swapped, b['rgba'], b['width'], b['height'],
             archive=env._archive, receipt_ledger=env._receipt_ledger),
             'valid receipt from another trial must not bind')
+
+    def test_public_verify_requires_ledger(self):
+        env = self.env
+        env.reset(19)
+        self.assertTrue(_next_scorable_stimulus(env))
+        env.act(_ports_for('incorrect')[:1] or [0])
+        obs = None
+        while env.probe.phase() != 'feedback':
+            obs = env.advance()
+            if env.probe.session_done():
+                break
+        self.assertIsNotNone(obs)
+        self.assertIn('outcome', obs)
+        self.assertFalse(
+            verify_public_outcome(
+                obs['outcome'], obs['rgba'], obs['width'], obs['height'],
+                archive=env._archive),
+            'archive without ledger must fail closed')
+        self.assertFalse(
+            verify_public_outcome(
+                obs['outcome'], obs['rgba'], obs['width'], obs['height'],
+                receipt_ledger=env._receipt_ledger),
+            'ledger without archive must fail closed')
+        self.assertTrue(verify_public_outcome(
+            obs['outcome'], obs['rgba'], obs['width'], obs['height'],
+            archive=env._archive, receipt_ledger=env._receipt_ledger))
 
     def test_count_fields_fail_verify(self):
         w, h = 20, 24
@@ -470,8 +535,12 @@ class ReceiptAndOutcomeTests(unittest.TestCase):
         leaked = dict(out)
         leaked['n_pos'] = 1
         leaked['n_neg'] = 0
+        ledger = {1: {
+            'receipt_id': 1, 'trial_seq': 1, 'stimulus_digest': d,
+            'evidence_digests': [d], 'feedback_digest': d,
+        }}
         self.assertFalse(verify_public_outcome(
-            leaked, rgba, w, h, archive={d: rgba}))
+            leaked, rgba, w, h, archive={d: rgba}, receipt_ledger=ledger))
 
     def test_delayed_resolution_keeps_stimulus_receipt(self):
         """Action during stimulus is resolved only at later feedback."""
@@ -605,6 +674,12 @@ class DeterminismTests(unittest.TestCase):
 
 @unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
 class ParityTests(unittest.TestCase):
+    """Stepped vs scheduled ``update()`` parity with the window hidden.
+
+    Limitation: this is not literal visible-window parity. The scheduled
+    path calls ``window.set_visible(False)``. Pixel, action, input,
+    outcome, and termination checks still run on the full session.
+    """
     @classmethod
     def setUpClass(cls):
         cls.env = DiagnosticEnv(seed=13, game_mode=2, num_trials=6)
@@ -649,7 +724,7 @@ class ParityTests(unittest.TestCase):
         bw.mode.step_mode = False
 
     def test_step_vs_scheduled_update_parity(self):
-        """Full-session headless step path vs scheduled update() (human clock)."""
+        """Full-session step vs scheduled update(); window stays hidden."""
         seed = 13
         env = self.env
         first = env.reset(seed)

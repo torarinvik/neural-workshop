@@ -19,6 +19,16 @@ sequences. Actions are opaque integer port indices.
 Shared-memory export (NW_SHM) is a one-way framebuffer dump, not a
 complete cross-process control protocol (no seqlock, no action channel,
 no reset/config, no ownership handshake).
+
+``verify_public_outcome`` is the learner-facing verifier. An outcome
+that carries a receipt ID requires both the immutable frame archive and
+the receipt ledger; omitting either fails closed. ``verify_public_pixels``
+is a diagnostic pixel-only check and must not be used as the public
+verifier.
+
+Parity tests compare the step driver to the scheduled ``update()``
+clock. They hide the window, so they prove stepped-versus-scheduled
+parity, not literal visible-window execution.
 """
 from __future__ import print_function
 
@@ -31,6 +41,9 @@ import time
 os.environ.setdefault('NW_HEADLESS', '1')
 
 import pyglet
+# Force silent audio *before* brainworkshop loads pyglet.media, so
+# headless training never starts OpenAL.
+pyglet.options['audio'] = ('silent',)
 if sys.platform.startswith('linux'):
     try:
         pyglet.options['headless'] = True
@@ -181,18 +194,8 @@ def _receipt_bound_to_evidence(rec, evidence):
     return True
 
 
-def verify_public_outcome(outcome, rgba, width, height, archive=None,
-                          receipt_ledger=None):
-    """Authenticate evidence, bind the receipt, then recompute the scalar.
-
-    If the outcome lists more than one evidence frame, ``archive`` is
-    mandatory. Each digest must map to immutable bytes that hash to it.
-    The current frame must match the last digest.
-
-    When ``receipt_ledger`` is given, the receipt must exist *and* be
-    bound to this stimulus digest / evidence sequence / action window.
-    Another valid receipt from a different trial is rejected.
-    """
+def _pixels_match_outcome(outcome, rgba, width, height, archive=None):
+    """Shared pixel/archive checks. No receipt binding."""
     if not outcome:
         return False
     if any(k not in _PUBLIC_OUTCOME_KEYS for k in outcome):
@@ -205,10 +208,6 @@ def verify_public_outcome(outcome, rgba, width, height, archive=None,
         return False
     if len(evidence) > 1 and archive is None:
         return False
-    if receipt_ledger is not None:
-        rec = receipt_ledger.get(outcome.get('receipt_id'))
-        if rec is None or not _receipt_bound_to_evidence(rec, evidence):
-            return False
     if archive is not None:
         for digest in evidence:
             stored = archive.get(digest)
@@ -221,6 +220,38 @@ def verify_public_outcome(outcome, rgba, width, height, archive=None,
     if recomputed is None:
         return False
     return recomputed['scalar'] == outcome.get('scalar')
+
+
+def verify_public_pixels(outcome, rgba, width, height, archive=None):
+    """Diagnostic: recompute the scalar from pixels (and optional archive).
+
+    Does not bind receipts. Not the learner-facing verifier.
+    """
+    return _pixels_match_outcome(outcome, rgba, width, height, archive)
+
+
+def verify_public_outcome(outcome, rgba, width, height, archive=None,
+                          receipt_ledger=None):
+    """Learner-facing verifier: archive + receipt binding + pixel scalar.
+
+    An outcome that contains a receipt ID fails closed unless both
+    ``archive`` and ``receipt_ledger`` are supplied. The receipt must
+    exist and be bound to this stimulus digest, trial sequence, action
+    window, and evidence list. Another valid receipt from a different
+    trial is rejected.
+
+    Use ``verify_public_pixels`` for a diagnostic pixel-only check.
+    """
+    if not outcome:
+        return False
+    if outcome.get('receipt_id') is not None:
+        if archive is None or receipt_ledger is None:
+            return False
+        evidence = list(outcome.get('evidence_digests') or [])
+        rec = receipt_ledger.get(outcome.get('receipt_id'))
+        if rec is None or not _receipt_bound_to_evidence(rec, evidence):
+            return False
+    return _pixels_match_outcome(outcome, rgba, width, height, archive)
 
 
 class FrameExport(object):
@@ -309,6 +340,9 @@ class _TestProbe(object):
 
     def session_done(self):
         return bool(bw.mode.session_done or bw.mode.phase == 'done')
+
+    def captured_audio(self):
+        return list(bw.audio_capture)
 
     def score_snapshot(self):
         return {
