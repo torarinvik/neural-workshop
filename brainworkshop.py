@@ -314,6 +314,16 @@ FIELD_EXPAND = False
 GRIDLINES = True
 CROSSHAIRS = True
 
+# Visual n-back grid is GRID_SIZE by GRID_SIZE. Squares and icons scale
+# to fit each cell. Default 3 is classic Dual N-Back (8 cells, center empty).
+# Even sizes (4, 6, ...) use every cell. Odd sizes skip the center unless
+# GRID_INCLUDE_CENTER is True.
+# GRID_SIZE_MAX is the upper bound for config and the in-game cycler (2..max).
+GRID_SIZE = 3
+GRID_SIZE_MIN = 2
+GRID_SIZE_MAX = 16
+GRID_INCLUDE_CENTER = False
+
 # Set the color of the square in non-Color N-Back modes.
 # This also affects Dual Combination N-Back and Arithmetic N-Back.
 # 1 = blue, 2 = cyan, 3 = green, 4 = grey,
@@ -776,6 +786,22 @@ def parse_config(configpath):
 
     if not 'CHANCE_OF_INTERFERENCE' in cfg:
         cfg.CHANCE_OF_INTERFERENCE = cfg.DEFAULT_CHANCE_OF_INTERFERENCE
+    try:
+        gmin = int(cfg.GRID_SIZE_MIN) if cfg.GRID_SIZE_MIN is not None else 2
+        gmax = int(cfg.GRID_SIZE_MAX) if cfg.GRID_SIZE_MAX is not None else 16
+        if gmin < 2:
+            gmin = 2
+        if gmax < gmin:
+            gmax = gmin
+        cfg.GRID_SIZE_MIN = gmin
+        cfg.GRID_SIZE_MAX = gmax
+        cfg.GRID_SIZE = max(gmin, min(gmax, int(cfg.GRID_SIZE)))
+    except Exception:
+        cfg.GRID_SIZE = 3
+        cfg.GRID_SIZE_MIN = 2
+        cfg.GRID_SIZE_MAX = 16
+    if cfg.GRID_INCLUDE_CENTER is None:
+        cfg.GRID_INCLUDE_CENTER = False
     rtrn = get_argv('--statsfile')
     if rtrn:
         cfg.STATSFILE = rtrn
@@ -2227,10 +2253,12 @@ class GameSelect(Menu):
         names = dict([(m, _("Use %s") % m) for m in modalities])
         names['position1'] = _("Use position")
         options.extend(["Blank line", 'combination', "Blank line", 'variable',
-            'crab', "Blank line", 'multi', 'multimode', 'Blank line',
+            'crab', "Blank line", 'grid', 'Blank line',
+            'multi', 'multimode', 'Blank line',
             'selfpaced', "Blank line", 'interference'])
         names['combination'] = _('Combination N-back mode')
         names['variable'] = _('Use variable N-Back levels')
+        names['grid'] = _('Grid size')
         names['crab'] = _('Crab-back mode (reverse order of sets of N stimuli)')
         names['multi'] = _('Simultaneous visual stimuli')
         names['multimode'] = _('Simultaneous stimuli differentiated by')
@@ -2253,6 +2281,13 @@ class GameSelect(Menu):
         vals['multi'] = Cycler(values=[1,2,3,4], default=mode.flags[mode.mode]['multi']-1)
         vals['multimode'] = Cycler(values=['color', 'image'], default=cfg.MULTI_MODE)
         vals['selfpaced'] = bool(mode.flags[mode.mode]['selfpaced'])
+        gmin, gmax = current_grid_bounds()
+        grid_values = list(range(gmin, gmax + 1))
+        try:
+            grid_default = grid_values.index(current_grid_size())
+        except ValueError:
+            grid_default = grid_values.index(3) if 3 in grid_values else 0
+        vals['grid'] = Cycler(values=grid_values, default=grid_default)
         for m in modalities:
             vals[m] = m in curmodes
         Menu.__init__(self, options, vals, names=names, title=_('Choose your game mode'))
@@ -2317,6 +2352,10 @@ class GameSelect(Menu):
         cfg.VARIABLE_NBACK = self.values['variable']
         cfg.MULTI_MODE = self.values['multimode'].value()
         cfg.CHANCE_OF_INTERFERENCE = self.values['interference'].value()
+        cfg.GRID_SIZE = int(self.values['grid'].value())
+        field.rebuild_grid()
+        for visual in visuals:
+            visual.sync_size()
         if self.newmode:
             mode.mode = self.newmode
 
@@ -2457,6 +2496,54 @@ class SoundSelect(Menu):
                 self.values[self.options[i]] = True
             self.update_labels()
 
+def current_grid_bounds():
+    try:
+        gmin = int(cfg.GRID_SIZE_MIN)
+    except Exception:
+        gmin = 2
+    try:
+        gmax = int(cfg.GRID_SIZE_MAX)
+    except Exception:
+        gmax = 16
+    gmin = max(2, gmin)
+    gmax = max(gmin, gmax)
+    return gmin, gmax
+
+
+def current_grid_size():
+    gmin, gmax = current_grid_bounds()
+    try:
+        return max(gmin, min(gmax, int(cfg.GRID_SIZE)))
+    except Exception:
+        return 3
+
+
+def current_include_center():
+    return bool(cfg.GRID_INCLUDE_CENTER)
+
+
+def current_cell_count():
+    return bwaccel.grid_cell_count(current_grid_size(), current_include_center())
+
+
+def current_cell_px():
+    n = current_grid_size()
+    return field.size / float(n)
+
+
+def position_pixel_center(position):
+    """Pixel center of a stimulus. position <= 0 is the field center."""
+    n = current_grid_size()
+    cell = current_cell_px()
+    cr = bwaccel.position_col_row(position, n, current_include_center())
+    if cr is None:
+        return int(field.center_x), int(field.center_y)
+    col, row = cr
+    x = int(round(field.center_x - field.size / 2.0 + cell * (col + 0.5)))
+    y = int(round(field.center_y - field.size / 2.0 + cell * (row + 0.5)))
+    return x, y
+
+
 # this class controls the field.
 # the field is the grid on which the squares appear
 class Field:
@@ -2484,27 +2571,58 @@ class Field:
         self.y3 = int(self.center_y - self.size/6)
         self.y4 = int(self.center_y + self.size/6)
 
-        # add the inside lines
-        if cfg.GRIDLINES:
-            if have_shapes:
-                self.v_lines = [pyglet.shapes.Line(self.x1, self.y3, self.x2, self.y3, color=self.color, batch=batch),
-                                pyglet.shapes.Line(self.x1, self.y4, self.x2, self.y4, color=self.color, batch=batch),
-                                pyglet.shapes.Line(self.x3, self.y1, self.x3, self.y2, color=self.color, batch=batch),
-                                pyglet.shapes.Line(self.x4, self.y1, self.x4, self.y2, color=self.color, batch=batch)]
-            else:
-                self.v_lines = batch.add(8, pyglet.gl.GL_LINES, None, ('v2i', (
-                    self.x1, self.y3,
-                    self.x2, self.y3,
-                    self.x1, self.y4,
-                    self.x2, self.y4,
-                    self.x3, self.y1,
-                    self.x3, self.y2,
-                    self.x4, self.y1,
-                    self.x4, self.y2)),
-                        ('c3B', self.color8))
+        self.v_lines = []
+        self._grid_batch_lines = None
+        self.draw_grid()
 
         self.crosshair_visible = False
         # initialize crosshair
+        self.crosshair_update()
+
+    def clear_grid(self):
+        if have_shapes:
+            for line in self.v_lines:
+                try:
+                    line.delete()
+                except Exception:
+                    pass
+            self.v_lines = []
+        elif self._grid_batch_lines is not None:
+            try:
+                self._grid_batch_lines.delete()
+            except Exception:
+                pass
+            self._grid_batch_lines = None
+
+    def draw_grid(self):
+        self.clear_grid()
+        if not cfg.GRIDLINES:
+            return
+        n = current_grid_size()
+        coords = []
+        for i in range(1, n):
+            t = i / float(n)
+            x = int(round(self.x1 + self.size * t))
+            y = int(round(self.y1 + self.size * t))
+            coords.extend((x, self.y1, x, self.y2))
+            coords.extend((self.x1, y, self.x2, y))
+        if not coords:
+            return
+        nverts = len(coords) // 2
+        if have_shapes:
+            self.v_lines = []
+            for i in range(0, len(coords), 4):
+                self.v_lines.append(pyglet.shapes.Line(
+                    coords[i], coords[i + 1], coords[i + 2], coords[i + 3],
+                    color=self.color, batch=batch))
+        else:
+            self._grid_batch_lines = batch.add(
+                nverts, pyglet.gl.GL_LINES, None,
+                ('v2i', tuple(coords)),
+                ('c3B', self.color * nverts))
+
+    def rebuild_grid(self):
+        self.draw_grid()
         self.crosshair_update()
 
     # draw the target cross in the center
@@ -2561,10 +2679,17 @@ class Visual:
             self.size_factor = 0.9375
         else:
             self.size_factor = 1.0
-        self.size = int(field.size / 3 * self.size_factor)
+        self.sync_size()
 
         # load an image set
         self.load_set()
+
+    def sync_size(self):
+        """Fit the square/icon to one cell of the current N×N grid."""
+        self.size = max(4, int(current_cell_px() * self.size_factor))
+        cell_font = max(8, int(current_cell_px() * 0.45))
+        self.label.font_size = cell_font
+        self.variable_label.font_size = cell_font
 
     def load_set(self, index=None):
         if type(index) == int:
@@ -2590,9 +2715,9 @@ class Visual:
         self.position = position
         self.color = get_color(color)
         self.vis = vis
+        self.sync_size()
 
-        self.center_x = field.center_x + (field.size // 3)*((position+1)%3 - 1) + (field.size // 3 - self.size)//2
-        self.center_y = field.center_y + (field.size // 3)*((position//3+1)%3 - 1) + (field.size // 3 - self.size)//2
+        self.center_x, self.center_y = position_pixel_center(position)
 
         if self.vis == 0:
             if cfg.OLD_STYLE_SQUARES:
@@ -2620,8 +2745,8 @@ class Visual:
                 # use sprite squares
                 self.square = self.spr_square[color-1]
                 self.square.opacity = 255
-                self.square.x = self.center_x - field.size // 6
-                self.square.y = self.center_y - field.size // 6
+                self.square.x = self.center_x - self.size // 2
+                self.square.y = self.center_y - self.size // 2
                 self.square.scale = 1.0 * self.size / self.spr_square_size
                 self.square_size_scaled = self.square.width
                 self.square.batch = batch
@@ -2646,8 +2771,8 @@ class Visual:
             self.square = self.images[vis-1]
             self.square.opacity = 255
             self.square.color = self.color[:3]
-            self.square.x = self.center_x - field.size // 6
-            self.square.y = self.center_y - field.size // 6
+            self.square.x = self.center_x - self.size // 2
+            self.square.y = self.center_y - self.size // 2
             self.square.scale = 1.0 * self.size / self.image_set_size
             self.square_size_scaled = self.square.width
             self.square.batch = batch
@@ -2663,7 +2788,7 @@ class Visual:
 
             if not 'position1' in mode.modalities[mode.mode]:
                 self.variable_label.x = field.center_x
-                self.variable_label.y = field.center_y - field.size//3 + 4
+                self.variable_label.y = field.center_y - int(current_cell_px()) + 4
             else:
                 self.variable_label.x = field.center_x
                 self.variable_label.y = field.center_y + 4
@@ -2685,8 +2810,8 @@ class Visual:
 
         self.square.scale += scale_addition
         dx = (self.square.width - self.square_size_scaled) // 2
-        self.square.x = self.center_x - field.size // 6 - dx
-        self.square.y = self.center_y - field.size // 6 - dx
+        self.square.x = self.center_x - self.size // 2 - dx
+        self.square.y = self.center_y - self.size // 2 - dx
 
         if self.age > fade_begin_time:
             factor = (1.0 - fade_end_transparency * (self.age - fade_begin_time) / (fade_end_time - fade_begin_time))
@@ -3265,11 +3390,12 @@ class SessionInfoLabel:
         if mode.started or CLINICAL_MODE:
             self.label.text = ''
         else:
-            self.label.text = _('Session:\n%1.2f sec/trial\n%i+%i trials\n%i seconds') % \
+            n = current_grid_size()
+            self.label.text = _('Session:\n%1.2f sec/trial\n%i+%i trials\n%i seconds\nGrid %i×%i') % \
                               (mode.ticks_per_trial / 10.0, mode.num_trials, \
                                mode.num_trials_total - mode.num_trials,
                                int((mode.ticks_per_trial / 10.0) * \
-                               (mode.num_trials_total)))
+                               (mode.num_trials_total)), n, n)
     def flash(self):
         pyglet.clock.unschedule(sessionInfoLabel.unflash)
         self.label.weight='bold'
@@ -4150,26 +4276,28 @@ def compute_bt_sequence():
     # Constructive generator in C (O(trials)); the old nested rejection
     # sampler could stall for minutes at high n-back (trials ≈ 20 + n²).
     mode.bt_sequence = bwaccel.compute_bt_sequence(
-        mode.num_trials_total, mode.back, 6, 6, 2)
+        mode.num_trials_total, mode.back, 6, 6, 2,
+        current_cell_count(), 8)
 
 player = get_pyglet_media_Player()
 player2 = get_pyglet_media_Player()
 # responsible for the random generation of each new stimulus (audio, color, position)
 def generate_stimulus():
     # first, randomly generate all stimuli
-    positions = bwaccel.sample_unique(1, 8, 4)   # sample without replacement
-    for s, p in zip(range(1, 5), positions):
+    ncells = current_cell_count()
+    k_multi = min(4, ncells)
+    positions = bwaccel.sample_unique(1, ncells, k_multi)
+    for s, p in zip(range(1, k_multi + 1), positions):
         mode.current_stim['position' + repr(s)] = p
         mode.current_stim['vis' + repr(s)] = random.randint(1, 8)
 
-    position_cell_order = (1, 2, 3, 6, 4, 5, 7, 8)
-    if not 2 <= cfg.POSITION_CELL_COUNT <= len(position_cell_order):
-        raise ValueError('POSITION_CELL_COUNT must be between 2 and 8')
+    position_cell_order = bwaccel.grid_center_out_ids(
+        current_grid_size(), current_include_center())
+    cell_cap = min(max(2, int(cfg.POSITION_CELL_COUNT)), len(position_cell_order))
     if mode.mode == 10:
-        active_position_cells = position_cell_order[:cfg.POSITION_CELL_COUNT]
+        active_position_cells = position_cell_order[:cell_cap]
         mode.current_stim['position1'] = random.choice(active_position_cells)
 
-    #mode.current_stim['position1'] = random.randint(1, 8)
     mode.current_stim['color']  = random.randint(1, 8)
     mode.current_stim['vis']    = random.randint(1, 8)
     mode.current_stim['audio']  = random.randint(1, 8)

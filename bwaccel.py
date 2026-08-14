@@ -20,6 +20,7 @@ mean_tail(seq, tail=0)      mean of the last ``tail`` items (0 = all)
 apply_arithmetic(op, a, b)  Decimal add/sub/mul/div (no eval)
 score_arithmetic(...)       rights/wrongs for an arithmetic session
 banner()                    'native: C' / 'native: Python'
+grid_layout / grid_cell_count / position_col_row
 seed(n=0)
 """
 from __future__ import print_function
@@ -65,13 +66,23 @@ def seed(n=0):
 # Pure-Python fallbacks
 # ---------------------------------------------------------------------------
 
-def _compute_bt_sequence_py(num_trials, nback, n_pos=6, n_audio=6, n_both=2):
+def _nonmatch_choice(prev, hi):
+    v = random.randint(1, hi)
+    if v == prev:
+        v = 1 if v == hi else v + 1
+    return v
+
+
+def _compute_bt_sequence_py(num_trials, nback, n_pos=6, n_audio=6, n_both=2,
+                            pos_choices=8, audio_choices=8):
     """Construct a sequence with exact match counts in O(T)."""
     T = num_trials - nback
     if num_trials < 1 or nback < 1 or T < 1:
         raise ValueError('num_trials must be > nback and both must be positive')
     if n_both < 0 or n_pos < n_both or n_audio < n_both:
         raise ValueError('cannot realize requested match counts')
+    if pos_choices < 2 or audio_choices < 2:
+        raise ValueError('pos_choices and audio_choices must be >= 2')
     n_pos_only = n_pos - n_both
     n_aud_only = n_audio - n_both
     n_neither = T - n_pos_only - n_aud_only - n_both
@@ -84,24 +95,18 @@ def _compute_bt_sequence_py(num_trials, nback, n_pos=6, n_audio=6, n_both=2):
             [0] * n_neither)
     random.shuffle(kind)
 
-    pos = [random.randint(1, 8) for _ in range(nback)]
-    audio = [random.randint(1, 8) for _ in range(nback)]
-
-    def _nonmatch(prev):
-        v = random.randint(1, 8)
-        if v == prev:
-            v = 1 if v == 8 else v + 1
-        return v
+    pos = [random.randint(1, pos_choices) for _ in range(nback)]
+    audio = [random.randint(1, audio_choices) for _ in range(nback)]
 
     for k in kind:
         if k & 1:
             pos.append(pos[-nback])
         else:
-            pos.append(_nonmatch(pos[-nback]))
+            pos.append(_nonmatch_choice(pos[-nback], pos_choices))
         if k & 2:
             audio.append(audio[-nback])
         else:
-            audio.append(_nonmatch(audio[-nback]))
+            audio.append(_nonmatch_choice(audio[-nback], audio_choices))
     return [pos, audio]
 
 
@@ -303,10 +308,13 @@ def _mean_tail_py(seq, tail=0):
 # Public wrappers — prefer C
 # ---------------------------------------------------------------------------
 
-def compute_bt_sequence(num_trials, nback, n_pos=6, n_audio=6, n_both=2):
+def compute_bt_sequence(num_trials, nback, n_pos=6, n_audio=6, n_both=2,
+                        pos_choices=8, audio_choices=8):
     if USING_NATIVE:
-        return _native.compute_bt_sequence(num_trials, nback, n_pos, n_audio, n_both)
-    return _compute_bt_sequence_py(num_trials, nback, n_pos, n_audio, n_both)
+        return _native.compute_bt_sequence(
+            num_trials, nback, n_pos, n_audio, n_both, pos_choices, audio_choices)
+    return _compute_bt_sequence_py(
+        num_trials, nback, n_pos, n_audio, n_both, pos_choices, audio_choices)
 
 
 def analyze_session(nback, crab=False, jaeggi_scoring=False,
@@ -408,6 +416,72 @@ def score_arithmetic(nback, crab=False, variable_list=None, session=None):
         except (InvalidOperation, ZeroDivisionError, ValueError, TypeError):
             wrongs += 1
     return (rights, wrongs)
+
+
+# Classic Dual N-Back 3x3 IDs (1-8 around the center, 0/9 = center).
+# col/row are 0..2 with (0,0) at the bottom-left (pyglet y-up).
+_CLASSIC_3X3 = {
+    0: (1, 1),
+    1: (2, 1), 2: (0, 1), 3: (1, 2),
+    4: (2, 2), 5: (0, 2), 6: (1, 0),
+    7: (2, 0), 8: (0, 0),
+    9: (1, 1),
+}
+
+
+def grid_layout(n, include_center=False):
+    """Return [(position_id, col, row), ...] for an n x n board."""
+    n = max(2, int(n))
+    include_center = bool(include_center)
+    if n == 3:
+        ids = list(range(1, 9))
+        if include_center:
+            ids.append(9)
+        return [(pid, _CLASSIC_3X3[pid][0], _CLASSIC_3X3[pid][1]) for pid in ids]
+
+    skip_center = (n % 2 == 1) and not include_center
+    cells = []
+    pid = 1
+    for row in range(n):
+        for col in range(n):
+            if skip_center and col == n // 2 and row == n // 2:
+                continue
+            cells.append((pid, col, row))
+            pid += 1
+    return cells
+
+
+def grid_cell_count(n, include_center=False):
+    return len(grid_layout(n, include_center))
+
+
+def position_col_row(position, n, include_center=False):
+    """Map a 1-based position id to (col, row), or None if unknown.
+
+    position <= 0 means “field center” (no cell).
+    """
+    n = max(2, int(n))
+    if position is None or int(position) <= 0:
+        return None
+    position = int(position)
+    if n == 3:
+        return _CLASSIC_3X3.get(position)
+    for pid, col, row in grid_layout(n, include_center):
+        if pid == position:
+            return (col, row)
+    return None
+
+
+def grid_center_out_ids(n, include_center=False):
+    """Position ids nearest the board center first (curriculum order)."""
+    n = max(2, int(n))
+    if n == 3 and not include_center:
+        return [1, 2, 3, 6, 4, 5, 7, 8]
+    cx = (n - 1) / 2.0
+    cy = (n - 1) / 2.0
+    cells = grid_layout(n, include_center)
+    cells = sorted(cells, key=lambda c: ((c[1] - cx) ** 2 + (c[2] - cy) ** 2, -c[2], c[1]))
+    return [c[0] for c in cells]
 
 
 def maybe_hint_compile():

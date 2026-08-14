@@ -96,6 +96,23 @@ static int rand_1_8(void)
     return 1 + (int)(pcg32() & 7u);
 }
 
+static int rand_choice(int maxv)
+{
+    if (maxv <= 1)
+        return 1;
+    if (maxv == 8)
+        return rand_1_8();
+    return randint_incl(1, maxv);
+}
+
+static int nonmatch_choice(int prev, int maxv)
+{
+    int v = rand_choice(maxv);
+    if (v == prev)
+        v = (v == maxv) ? 1 : v + 1;
+    return v;
+}
+
 static double rand_u01(void)
 {
     /* 24-bit mantissa in (0, 1] — never exactly 0, so pow() is safe. */
@@ -207,6 +224,7 @@ static PyObject *ints_to_list(const int *a, int n)
 
 static int build_bt_sequence(int ntrials, int nback,
                              int n_pos, int n_audio, int n_both,
+                             int pos_max, int audio_max,
                              int *pos, int *audio)
 {
     int T, n_pos_only, n_aud_only, n_neither;
@@ -214,6 +232,8 @@ static int build_bt_sequence(int ntrials, int nback,
     int i, t;
 
     if (ntrials < 1 || nback < 1 || nback >= ntrials)
+        return -1;
+    if (pos_max < 2 || audio_max < 2)
         return -1;
 
     T = ntrials - nback;
@@ -241,8 +261,8 @@ static int build_bt_sequence(int ntrials, int nback,
     shuffle_ints(kind, T);
 
     for (t = 0; t < nback; ++t) {
-        pos[t] = rand_1_8();
-        audio[t] = rand_1_8();
+        pos[t] = rand_choice(pos_max);
+        audio[t] = rand_choice(audio_max);
     }
 
     for (t = 0; t < T; ++t) {
@@ -251,16 +271,12 @@ static int build_bt_sequence(int ntrials, int nback,
         if (k & 1) {
             pos[idx] = pos[idx - nback];
         } else {
-            pos[idx] = rand_1_8();
-            if (pos[idx] == pos[idx - nback])
-                pos[idx] = (pos[idx] == 8) ? 1 : pos[idx] + 1;
+            pos[idx] = nonmatch_choice(pos[idx - nback], pos_max);
         }
         if (k & 2) {
             audio[idx] = audio[idx - nback];
         } else {
-            audio[idx] = rand_1_8();
-            if (audio[idx] == audio[idx - nback])
-                audio[idx] = (audio[idx] == 8) ? 1 : audio[idx] + 1;
+            audio[idx] = nonmatch_choice(audio[idx - nback], audio_max);
         }
     }
 
@@ -272,12 +288,14 @@ static PyObject *py_compute_bt_sequence(PyObject *self, PyObject *args)
 {
     int ntrials, nback;
     int n_pos = 6, n_audio = 6, n_both = 2;
+    int pos_choices = 8, audio_choices = 8;
     int *pos = NULL, *audio = NULL;
     PyObject *pos_list = NULL, *audio_list = NULL, *result = NULL;
     int rc;
 
     (void)self;
-    if (!PyArg_ParseTuple(args, "ii|iii", &ntrials, &nback, &n_pos, &n_audio, &n_both))
+    if (!PyArg_ParseTuple(args, "ii|iiiii", &ntrials, &nback, &n_pos, &n_audio,
+                          &n_both, &pos_choices, &audio_choices))
         return NULL;
 
     if (ntrials <= 0 || nback <= 0 || nback >= ntrials) {
@@ -294,7 +312,8 @@ static PyObject *py_compute_bt_sequence(PyObject *self, PyObject *args)
         return PyErr_NoMemory();
     }
 
-    rc = build_bt_sequence(ntrials, nback, n_pos, n_audio, n_both, pos, audio);
+    rc = build_bt_sequence(ntrials, nback, n_pos, n_audio, n_both,
+                           pos_choices, audio_choices, pos, audio);
     if (rc != 0) {
         PyMem_Free(pos);
         PyMem_Free(audio);

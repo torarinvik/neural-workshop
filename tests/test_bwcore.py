@@ -58,6 +58,48 @@ class SequenceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bwaccel.compute_bt_sequence(8, 2, 20, 20, 10)
 
+    def test_custom_position_range(self):
+        pos, audio = bwaccel.compute_bt_sequence(40, 2, 6, 6, 2, 16, 8)
+        self.assertTrue(all(1 <= v <= 16 for v in pos))
+        self.assertTrue(all(1 <= v <= 8 for v in audio))
+        self.assertEqual(_count_matches(pos, 2), 6)
+
+
+class GridLayoutTests(unittest.TestCase):
+    def test_classic_3x3_has_eight_cells(self):
+        cells = bwaccel.grid_layout(3, include_center=False)
+        self.assertEqual(len(cells), 8)
+        self.assertEqual(bwaccel.grid_cell_count(3), 8)
+        # IDs 1-8 and no center (1,1) except via id 0/9
+        coords = {(c, r) for _, c, r in cells}
+        self.assertNotIn((1, 1), coords)
+        self.assertEqual(bwaccel.position_col_row(1, 3), (2, 1))
+        self.assertEqual(bwaccel.position_col_row(8, 3), (0, 0))
+        self.assertIsNone(bwaccel.position_col_row(0, 3))
+
+    def test_4x4_uses_every_cell(self):
+        cells = bwaccel.grid_layout(4)
+        self.assertEqual(len(cells), 16)
+        self.assertEqual(bwaccel.grid_cell_count(4), 16)
+        self.assertEqual(bwaccel.position_col_row(1, 4), (0, 0))
+        self.assertEqual(bwaccel.position_col_row(16, 4), (3, 3))
+
+    def test_large_grids(self):
+        self.assertEqual(bwaccel.grid_cell_count(10), 100)
+        self.assertEqual(bwaccel.grid_cell_count(16), 256)
+        self.assertEqual(bwaccel.position_col_row(256, 16), (15, 15))
+
+    def test_5x5_skips_center_unless_asked(self):
+        self.assertEqual(bwaccel.grid_cell_count(5, False), 24)
+        self.assertEqual(bwaccel.grid_cell_count(5, True), 25)
+        coords = {(c, r) for _, c, r in bwaccel.grid_layout(5, False)}
+        self.assertNotIn((2, 2), coords)
+
+    def test_center_out_3x3_curriculum(self):
+        self.assertEqual(
+            bwaccel.grid_center_out_ids(3),
+            [1, 2, 3, 6, 4, 5, 7, 8])
+
 
 class AnalyzeTests(unittest.TestCase):
     def _session(self):
