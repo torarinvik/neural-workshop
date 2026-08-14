@@ -21,6 +21,7 @@ apply_arithmetic(op, a, b)  Decimal add/sub/mul/div (no eval)
 score_arithmetic(...)       rights/wrongs for an arithmetic session
 banner()                    'native: C' / 'native: Python'
 grid_layout / grid_cell_count / position_col_row
+ms_to_ticks / clamp_trial_interval_ms
 seed(n=0)
 """
 from __future__ import print_function
@@ -482,6 +483,52 @@ def grid_center_out_ids(n, include_center=False):
     cells = grid_layout(n, include_center)
     cells = sorted(cells, key=lambda c: ((c[1] - cx) ** 2 + (c[2] - cy) ** 2, -c[2], c[1]))
     return [c[0] for c in cells]
+
+
+def ms_to_ticks(ms, tick_ms=100):
+    """Convert a duration in milliseconds to an integer tick count (>= 1)."""
+    tick_ms = max(1, int(tick_ms))
+    try:
+        ms = float(ms)
+    except (TypeError, ValueError):
+        ms = tick_ms
+    return max(1, int(round(ms / tick_ms)))
+
+
+def clamp_trial_interval_ms(ms, tick_ms=100, min_ticks=3, max_ms=60000):
+    """Keep a trial interval on the clock grid and inside [min_ticks*tick, max_ms]."""
+    tick_ms = max(1, int(tick_ms))
+    min_ticks = max(2, int(min_ticks))
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        ms = tick_ms * min_ticks
+    lo = tick_ms * min_ticks
+    hi = max(lo, int(max_ms))
+    if ms < lo:
+        ms = lo
+    if ms > hi:
+        ms = hi
+    # Snap to the scheduler quantum so ticks * tick_ms == interval.
+    ticks = ms_to_ticks(ms, tick_ms)
+    return ticks * tick_ms
+
+
+def interval_adjust_step(ms):
+    """F5/F6 step: 1 ms at high speed, larger steps when the trial is long."""
+    try:
+        ms = int(ms)
+    except (TypeError, ValueError):
+        ms = 100
+    if ms <= 20:
+        return 1
+    if ms <= 100:
+        return 5
+    if ms <= 500:
+        return 10
+    if ms <= 2000:
+        return 50
+    return 100
 
 
 def maybe_hint_compile():

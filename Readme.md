@@ -45,6 +45,28 @@ stable compared to the original project and work with modern Python and Pyglet
 ## Notes:
 * You need pyglet installed for this to work.
 
+### Trial timing (milliseconds)
+
+Human play still defaults to 100 ms ticks and ~3 s per trial. For faster
+agent training you can set millisecond intervals:
+
+```
+./run --headless --tick-ms 1 --trial-ms 50
+```
+
+- `--trial-ms N` — length of one cell/trial in milliseconds
+- `--tick-ms N` — scheduler quantum (use `1` for true ms control)
+- `--stim-ms N` — how long the stimulus stays visible
+- `--headless` — skip the title screen, hide the window, mute music,
+  default to a 1 ms clock and 10 ms trials (override with `--trial-ms`)
+
+In game: **C** → *Trial interval (ms)*, or **F5** / **F6** in Manual mode.
+Config keys: `TRIAL_INTERVAL_MS`, `TICK_DURATION_MS`, `STIMULUS_DURATION_MS`,
+`FEEDBACK_DURATION_MS`, `HEADLESS`.
+
+The window buffer is still drawn each frame in headless mode so you can
+capture it for an agent; a dedicated frame-export hook can be added next.
+
 ### Grid size
 
 The board is `GRID_SIZE` × `GRID_SIZE`. Squares, letters, and images

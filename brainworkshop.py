@@ -96,7 +96,9 @@ WEB_MORSE           = 'https://en.wikipedia.org/wiki/Morse_code'
 TIMEOUT_SILENT =  3
 TICKS_MIN      =  3
 TICKS_MAX      = 50
-TICK_DURATION  =  0.1
+TICK_DURATION  =  0.1  # seconds; kept in sync with cfg.TICK_DURATION_MS
+HEADLESS       = '--headless' in sys.argv or \
+    os.environ.get('NW_HEADLESS', '').lower() in ('1', 'true', 'yes')
 DEFAULT_WINDOW_WIDTH  = 912
 DEFAULT_WINDOW_HEIGHT = 684
 preventMusicSkipping  = True
@@ -460,6 +462,24 @@ TICKS_7 = 40
 TICKS_8 = 40
 TICKS_9 = 40
 
+# Scheduler quantum in milliseconds. Human play: 100 (legacy 0.1 s ticks).
+# For high-throughput / headless agent training use 1.
+TICK_DURATION_MS = 100
+
+# Length of one trial in milliseconds. 0 = derive from TICKS_* × TICK_DURATION_MS
+# (so TICKS_DEFAULT=30 and 100 ms ticks → 3000 ms). Set this for ms control,
+# e.g. 50 for a 50 ms cell interval.
+TRIAL_INTERVAL_MS = 0
+
+# How long the square/icon stays visible inside a trial (ms).
+STIMULUS_DURATION_MS = 500
+
+# Missed-match feedback flashed at the end of a trial (ms).
+FEEDBACK_DURATION_MS = 200
+
+# Headless training: skip title, hide the window, no music. Also --headless.
+HEADLESS = False
+
 # Tick bonuses for crab and multi-modes not listed above.  Can be negative
 # if you're a masochist.
 
@@ -661,7 +681,10 @@ def dump_pyglet_info():
 if '--debug' in sys.argv:
     DEBUG = True
     debug_msg(bwaccel.banner())
-if '--vsync' in sys.argv or sys.platform == 'darwin':
+if '--headless' in sys.argv:
+    HEADLESS = True
+# Vsync caps throughput; leave it off in headless agent runs.
+if '--vsync' in sys.argv or (sys.platform == 'darwin' and not HEADLESS):
     VSYNC = True
 if '--dump' in sys.argv:
     dump_pyglet_info()
@@ -864,6 +887,87 @@ if trial_count_override is not None:
 if os.environ.get('BRAINWORKSHOP_MUTE_MUSIC', '').lower() in (
         '1', 'true', 'yes', 'on'):
     cfg.USE_MUSIC = False
+
+# Millisecond timing + headless overrides (CLI / env win over config.ini).
+_trial_ms = get_argv('--trial-ms') or os.environ.get('NW_TRIAL_MS')
+if _trial_ms is not None:
+    cfg.TRIAL_INTERVAL_MS = int(_trial_ms)
+_tick_ms = get_argv('--tick-ms') or os.environ.get('NW_TICK_MS')
+if _tick_ms is not None:
+    cfg.TICK_DURATION_MS = int(_tick_ms)
+_stim_ms = get_argv('--stim-ms') or os.environ.get('NW_STIM_MS')
+if _stim_ms is not None:
+    cfg.STIMULUS_DURATION_MS = int(_stim_ms)
+if HEADLESS or cfg.HEADLESS:
+    HEADLESS = True
+    cfg.HEADLESS = True
+    cfg.SKIP_TITLE_SCREEN = True
+    cfg.USE_MUSIC = False
+    cfg.USE_APPLAUSE = False
+    if not cfg.TRIAL_INTERVAL_MS:
+        # Fast default for agent loops unless the user already picked an interval.
+        if not cfg.TICK_DURATION_MS or int(cfg.TICK_DURATION_MS) >= 100:
+            cfg.TICK_DURATION_MS = 1
+        cfg.TRIAL_INTERVAL_MS = max(10, int(cfg.TICK_DURATION_MS) * 10)
+
+try:
+    cfg.TICK_DURATION_MS = max(1, int(cfg.TICK_DURATION_MS or 100))
+except Exception:
+    cfg.TICK_DURATION_MS = 100
+TICK_DURATION = cfg.TICK_DURATION_MS / 1000.0
+try:
+    cfg.STIMULUS_DURATION_MS = max(1, int(cfg.STIMULUS_DURATION_MS or 500))
+except Exception:
+    cfg.STIMULUS_DURATION_MS = 500
+try:
+    cfg.FEEDBACK_DURATION_MS = max(1, int(cfg.FEEDBACK_DURATION_MS or 200))
+except Exception:
+    cfg.FEEDBACK_DURATION_MS = 200
+
+
+def tick_duration_ms():
+    try:
+        return max(1, int(cfg.TICK_DURATION_MS))
+    except Exception:
+        return 100
+
+
+def trial_interval_ms():
+    try:
+        ms = int(cfg.TRIAL_INTERVAL_MS or 0)
+    except Exception:
+        ms = 0
+    if ms > 0:
+        return bwaccel.clamp_trial_interval_ms(ms, tick_duration_ms())
+    return int(mode.ticks_per_trial) * tick_duration_ms()
+
+
+def set_trial_interval_ms(ms):
+    ms = bwaccel.clamp_trial_interval_ms(ms, tick_duration_ms())
+    cfg.TRIAL_INTERVAL_MS = ms
+    mode.ticks_per_trial = bwaccel.ms_to_ticks(ms, tick_duration_ms())
+    return ms
+
+
+def apply_trial_interval_override():
+    try:
+        ms = int(cfg.TRIAL_INTERVAL_MS or 0)
+    except Exception:
+        ms = 0
+    if ms > 0:
+        set_trial_interval_ms(ms)
+
+
+def stimulus_hide_tick():
+    positions = len([mod for mod in mode.modalities[mode.mode] if mod.startswith('position')])
+    positions = max(0, positions - 1)
+    hide = bwaccel.ms_to_ticks(cfg.STIMULUS_DURATION_MS, tick_duration_ms()) + positions
+    return min(hide, max(2, mode.ticks_per_trial - 1))
+
+
+def feedback_tick():
+    fb = bwaccel.ms_to_ticks(cfg.FEEDBACK_DURATION_MS, tick_duration_ms())
+    return max(2, mode.ticks_per_trial - fb)
 
 if CLINICAL_MODE:
     cfg.JAEGGI_INTERFACE_DEFAULT_SCORING = False
@@ -1180,6 +1284,11 @@ if cfg.WINDOW_FULLSCREEN:
     window.maximize()
     window.set_fullscreen(cfg.WINDOW_FULLSCREEN)
     window.set_mouse_visible(False)
+if HEADLESS:
+    try:
+        window.set_visible(False)
+    except Exception:
+        pass
 
 
 # All changeable game state variables are located in an instance of the Mode class
@@ -2253,12 +2362,13 @@ class GameSelect(Menu):
         names = dict([(m, _("Use %s") % m) for m in modalities])
         names['position1'] = _("Use position")
         options.extend(["Blank line", 'combination', "Blank line", 'variable',
-            'crab', "Blank line", 'grid', 'Blank line',
+            'crab', "Blank line", 'grid', 'trial_ms', 'Blank line',
             'multi', 'multimode', 'Blank line',
             'selfpaced', "Blank line", 'interference'])
         names['combination'] = _('Combination N-back mode')
         names['variable'] = _('Use variable N-Back levels')
         names['grid'] = _('Grid size')
+        names['trial_ms'] = _('Trial interval (ms)')
         names['crab'] = _('Crab-back mode (reverse order of sets of N stimuli)')
         names['multi'] = _('Simultaneous visual stimuli')
         names['multimode'] = _('Simultaneous stimuli differentiated by')
@@ -2288,6 +2398,18 @@ class GameSelect(Menu):
         except ValueError:
             grid_default = grid_values.index(3) if 3 in grid_values else 0
         vals['grid'] = Cycler(values=grid_values, default=grid_default)
+        trial_ms_values = [1, 2, 5, 10, 16, 20, 25, 33, 50, 75, 100, 150,
+                           200, 250, 333, 500, 750, 1000, 1500, 2000, 2500,
+                           3000, 4000, 5000]
+        cur_ms = trial_interval_ms()
+        if cur_ms not in trial_ms_values:
+            trial_ms_values.append(cur_ms)
+            trial_ms_values.sort()
+        try:
+            trial_ms_default = trial_ms_values.index(cur_ms)
+        except ValueError:
+            trial_ms_default = trial_ms_values.index(3000) if 3000 in trial_ms_values else 0
+        vals['trial_ms'] = Cycler(values=trial_ms_values, default=trial_ms_default)
         for m in modalities:
             vals[m] = m in curmodes
         Menu.__init__(self, options, vals, names=names, title=_('Choose your game mode'))
@@ -2344,6 +2466,7 @@ class GameSelect(Menu):
         if not mode.manual:
             mode.enforce_standard_mode()
             stats.retrieve_progress()
+        apply_trial_interval_override()
         update_all_labels()
         circles.update()
 
@@ -2356,6 +2479,7 @@ class GameSelect(Menu):
         field.rebuild_grid()
         for visual in visuals:
             visual.sync_size()
+        set_trial_interval_ms(int(self.values['trial_ms'].value()))
         if self.newmode:
             mode.mode = self.newmode
 
@@ -3391,11 +3515,16 @@ class SessionInfoLabel:
             self.label.text = ''
         else:
             n = current_grid_size()
-            self.label.text = _('Session:\n%1.2f sec/trial\n%i+%i trials\n%i seconds\nGrid %i×%i') % \
-                              (mode.ticks_per_trial / 10.0, mode.num_trials, \
+            ms = trial_interval_ms()
+            if ms < 1000:
+                timing = _('%i ms/trial') % ms
+            else:
+                timing = _('%1.2f sec/trial') % (ms / 1000.0)
+            session_s = int((ms / 1000.0) * mode.num_trials_total)
+            self.label.text = _('Session:\n%s\n%i+%i trials\n%i seconds\nGrid %i×%i') % \
+                              (timing, mode.num_trials,
                                mode.num_trials_total - mode.num_trials,
-                               int((mode.ticks_per_trial / 10.0) * \
-                               (mode.num_trials_total)), n, n)
+                               session_s, n, n)
     def flash(self):
         pyglet.clock.unschedule(sessionInfoLabel.unflash)
         self.label.weight='bold'
@@ -4693,14 +4822,14 @@ def on_key_press(symbol, modifiers):
             sessionInfoLabel.flash()
 
         elif symbol == key.F5 and mode.manual:
-            if mode.ticks_per_trial < TICKS_MAX:
-                mode.ticks_per_trial += 1
-                sessionInfoLabel.flash()
+            ms = trial_interval_ms()
+            set_trial_interval_ms(ms + bwaccel.interval_adjust_step(ms))
+            sessionInfoLabel.flash()
 
         elif symbol == key.F6 and mode.manual:
-            if mode.ticks_per_trial > TICKS_MIN:
-                mode.ticks_per_trial -= 1
-                sessionInfoLabel.flash()
+            ms = trial_interval_ms()
+            set_trial_interval_ms(ms - bwaccel.interval_adjust_step(ms))
+            sessionInfoLabel.flash()
 
         elif symbol == key.C and (modifiers & key.MOD_CTRL):
             stats.clear()
@@ -4805,7 +4934,7 @@ def on_key_press(symbol, modifiers):
                         update_input_labels()
 
         if symbol == cfg.KEY_ADVANCE and mode.flags[mode.mode]['selfpaced']:
-            mode.tick = mode.ticks_per_trial-2
+            mode.tick = feedback_tick()
 
     return pyglet.event.EVENT_HANDLED
 # the loop where everything is drawn on the screen.
@@ -4831,19 +4960,17 @@ def on_draw():
     for label in input_labels:
         label.draw()
 
-# the event timer loop. Runs every 1/10 second. This loop controls the session
-# game logic.
-# During each trial the tick goes from 1 to ticks_per_trial-1 then back to 0.
-# tick = 1: Input from the last trial is saved. Input is reset.
-#             A new square appears and the sound cue plays.
-# tick = 6: the square disappears.
-# tick = ticks_per_trial - 1: tick is reset to 0.
-# tick = 1: etc.
+# Session timer. Period is cfg.TICK_DURATION_MS (default 100 ms; 1 ms for
+# high-throughput / headless training). Trial length is TRIAL_INTERVAL_MS.
+# tick = 1: save last trial, spawn the next stimulus.
+# hide tick: square disappears (STIMULUS_DURATION_MS).
+# feedback tick: missed-match flash, then wrap to the next trial.
 def update(dt):
     if mode.started and not mode.paused: # only run the timer during a game
+        hide_at = stimulus_hide_tick()
         if (not mode.flags[mode.mode]['selfpaced'] or
-                mode.tick > mode.ticks_per_trial-6 or
-                mode.tick < 5):
+                mode.tick > mode.ticks_per_trial - hide_at or
+                mode.tick < hide_at):
             mode.tick += 1
         if mode.tick == 1:
             mode.show_missed = False
@@ -4856,12 +4983,10 @@ def update(dt):
                 end_session()
             else: generate_stimulus()
             reset_input()
-        # Hide square at either the 0.5 second mark or sooner
-        positions = len([mod for mod in mode.modalities[mode.mode] if mod.startswith('position')])
-        positions = max(0, positions-1)
-        if mode.tick == (6+positions) or mode.tick == mode.ticks_per_trial - 1:
+        if mode.tick >= hide_at and mode.tick > 1:
             for visual in visuals: visual.hide()
-        if mode.tick == mode.ticks_per_trial - 2:  # display feedback for 200 ms
+        fb_at = feedback_tick()
+        if mode.tick >= fb_at and mode.tick > 1:
             mode.tick = 0
             mode.show_missed = True
             update_input_labels()
@@ -4945,6 +5070,7 @@ stats.parse_statsfile()
 if len(stats.full_history) > 0 and not cfg.JAEGGI_MODE:
     mode.mode = stats.full_history[-1][1]
 stats.retrieve_progress()
+apply_trial_interval_override()
 
 update_all_labels()
 
@@ -4984,7 +5110,12 @@ for msg in messagequeue:
 
 # start the event loops!
 if __name__ == '__main__':
-
+    if HEADLESS:
+        mode.title_screen = False
+        new_session()
+        if DEBUG:
+            debug_msg('headless session: %i ms/trial, %i ms tick, %i trials' % (
+                trial_interval_ms(), tick_duration_ms(), mode.num_trials_total))
     pyglet.app.run()
 
 # nothing below the line "pyglet.app.run()" will be executed until the

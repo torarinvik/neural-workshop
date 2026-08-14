@@ -283,6 +283,24 @@ class ArithmeticTests(unittest.TestCase):
         self.assertEqual((rights, wrongs), (0, 1))
 
 
+class TimingTests(unittest.TestCase):
+    def test_ms_to_ticks(self):
+        self.assertEqual(bwaccel.ms_to_ticks(3000, 100), 30)
+        self.assertEqual(bwaccel.ms_to_ticks(50, 1), 50)
+        self.assertEqual(bwaccel.ms_to_ticks(1, 1), 1)
+        self.assertEqual(bwaccel.ms_to_ticks(0, 100), 1)
+
+    def test_clamp_snaps_to_quantum(self):
+        self.assertEqual(bwaccel.clamp_trial_interval_ms(50, 1), 50)
+        self.assertEqual(bwaccel.clamp_trial_interval_ms(1, 1), 3)  # min 3 ticks
+        self.assertEqual(bwaccel.clamp_trial_interval_ms(350, 100), 400)
+
+    def test_adjust_step(self):
+        self.assertEqual(bwaccel.interval_adjust_step(10), 1)
+        self.assertEqual(bwaccel.interval_adjust_step(80), 5)
+        self.assertEqual(bwaccel.interval_adjust_step(3000), 100)
+
+
 class BackendTests(unittest.TestCase):
     def test_backend_string(self):
         self.assertIn(bwaccel.backend(), ('C', 'Python'))
