@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Build the Brain Workshop C extension in-place:
+"""Build the Neural Workshop C extension in-place:
 
     python setup.py build_ext --inplace
 """

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Accelerated kernels for Brain Workshop.
+"""Accelerated kernels for Neural Workshop.
 
 Imports the compiled ``bwcore`` C extension when it is on sys.path.
 If the extension is missing, every public function falls back to a

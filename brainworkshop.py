@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 #------------------------------------------------------------------------------
-# Brain Workshop: a Dual N-Back game in Python
+# Neural Workshop: a Dual N-Back gym in Python
 #
 # This is a fork of the popular Brain Workshop game. Development on the original
 # has not happened for many years. The fork is available at:
@@ -1346,7 +1346,7 @@ caption = []
 if CLINICAL_MODE:
     caption.append('BW-Clinical ')
 else:
-    caption.append('Brain Workshop ')
+    caption.append('Neural Workshop ')
 caption.append(VERSION)
 if USER != 'default':
     caption.append(' - ')
@@ -3307,7 +3307,7 @@ class KeysListLabel:
 class TitleMessageLabel:
     def __init__(self):
         self.label = pyglet.text.Label(
-            _('Brain Workshop'),
+            _('Neural Workshop'),
             #multiline = True, width = window.width // 2,
             font_size=calc_fontsize(32), weight='bold', color = cfg.COLOR_TEXT,
             x = width_center(), y = from_top_edge(25),

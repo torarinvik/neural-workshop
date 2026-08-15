@@ -112,6 +112,22 @@ Benchmark (reports trials/s, never “experiences/s”):
 an independent center-out curriculum. The session panel shows
 `Grid 4×4 (8/16 cells)` when a subset is active.
 
+Neural Workshop is the canonical training gym. Session difficulty belongs
+on `NeuralWorkshopEnv`:
+
+```
+from nwenv import NeuralWorkshopEnv
+env = NeuralWorkshopEnv(
+    seed=17, game_mode=2, n_back=1, num_trials=60,
+    grid_size=3, active_cells=8, visible=False,
+)
+```
+
+`game_mode=2` is Dual (pixels + public PCM). `game_mode=10` is Position.
+Do not train by patching a separate Brain Workshop or by poking `bw.cfg`.
+A visible window (`visible=True` and `NW_HEADLESS=0`) is for watching the
+gym; the learner still sees only the public observation.
+
 ### Grid size
 
 The board is `GRID_SIZE` × `GRID_SIZE`. Squares, letters, and images

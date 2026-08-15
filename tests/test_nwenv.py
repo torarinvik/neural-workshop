@@ -135,11 +135,13 @@ class CaptureAndPhaseTests(unittest.TestCase):
     def test_public_observation_schema(self):
         obs = self.env.reset(1)
         allowed = {'frame_seq', 'timestamp_ns', 'width', 'height',
-                   'rgba', 'done', 'outcome'}
+                   'rgba', 'done', 'outcome',
+                   'audio_pcm', 'audio_rate', 'audio_channels',
+                   'audio_sample_width'}
         self.assertTrue(set(obs.keys()) <= allowed)
         for leaked in ('phase', 'position1', 'correct', 'match',
                        'bt_sequence', 'current_stim', 'feedback',
-                       'n_pos', 'n_neg'):
+                       'n_pos', 'n_neg', 'letter', 'audio'):
             self.assertNotIn(leaked, obs)
 
     def test_significant_states_once_each(self):
@@ -913,6 +915,23 @@ class DualModalityLiveTests(unittest.TestCase):
             self.env._trial_digests,
             self.env._trial_receipt['receipt_id'])
 
+    def test_dual_stimulus_publishes_waveform_not_letter_id(self):
+        self.env.reset(30)
+        found = None
+        for _ in range(40):
+            obs = self.env.observe()
+            if self.env.probe.phase() == 'stimulus' and obs.get('audio_pcm'):
+                found = obs
+                break
+            self.env.advance()
+        self.assertIsNotNone(found)
+        self.assertIsInstance(found['audio_pcm'], (bytes, bytearray))
+        self.assertGreater(len(found['audio_pcm']), 0)
+        self.assertGreater(int(found['audio_rate']), 0)
+        self.assertNotIn('audio', found)
+        self.assertNotIn('current_stim', found)
+        self.assertNotIn('letter', found)
+
     def test_dual_one_correct_one_incorrect(self):
         self.env.reset(30)
         self.assertGreaterEqual(self.env.n_actions, 2)
@@ -972,6 +991,52 @@ class DualModalityLiveTests(unittest.TestCase):
         self.assertEqual(found['n_pos'], 1)
         self.assertEqual(found['n_neg'], 1)
         self.assertEqual(found['scalar'], 0.0)
+
+
+@unittest.skipIf(DiagnosticEnv is None, 'nwenv import failed: %s' % _ENV_IMPORT_ERROR)
+class GymConfigTests(unittest.TestCase):
+    """Constructor-owned session knobs. Training must not poke bw.cfg."""
+
+    def test_constructor_applies_and_keeps_session_knobs(self):
+        env = DiagnosticEnv(
+            seed=8,
+            game_mode=10,
+            num_trials=12,
+            n_back=3,
+            grid_size=3,
+            active_cells=2,
+        )
+        try:
+            self.assertEqual(bw.mode.mode, 10)
+            self.assertEqual(bw.mode.back, 3)
+            self.assertEqual(bw.mode.num_trials_total, 12)
+            self.assertEqual(bw.cfg.GRID_SIZE, 3)
+            self.assertEqual(bw.cfg.ACTIVE_POSITION_CELLS, 2)
+            self.assertFalse(bw.cfg.USE_MUSIC)
+            self.assertTrue(bw.mode.manual)
+            env.reset(9)
+            self.assertEqual(bw.mode.back, 3)
+            self.assertEqual(bw.mode.num_trials_total, 12)
+            self.assertEqual(len(bw.current_active_position_ids()), 2)
+        finally:
+            env.close()
+            bw.cfg.GRID_SIZE = 3
+            bw.cfg.ACTIVE_POSITION_CELLS = 0
+            bw.cfg.POSITION_CELL_COUNT = 0
+            bw.cfg.GAME_MODE = 2
+            bw.mode.mode = 2
+            bw.mode.back = 2
+
+    def test_dual_constructor_sets_two_ports_and_depth(self):
+        env = DiagnosticEnv(
+            seed=11, game_mode=2, num_trials=8, n_back=1,
+        )
+        try:
+            self.assertEqual(bw.mode.mode, 2)
+            self.assertEqual(bw.mode.back, 1)
+            self.assertEqual(env.n_actions, 2)
+        finally:
+            env.close()
 
 
 class CurriculumTests(unittest.TestCase):

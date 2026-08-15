@@ -9,12 +9,18 @@ act(ports)  → receipt | rejected
 advance()   → observation
 step(ports) → (observation, events, done)
 
-Observation fields: frame_seq, timestamp_ns, width, height, rgba, done,
-optional drain-once outcome {scalar, evidence_digests, receipt_id,
-frame_seq, timestamp_ns}.
+Constructor-owned gym knobs (do not poke ``bw.cfg`` from a learner):
+game_mode, num_trials, n_back, grid_size, active_cells, mute_music,
+mute_applause, visible. These survive ``reset``.
 
-No cell IDs, modality names, phase names, scores, label counts, or
-sequences. Actions are opaque integer port indices.
+Observation fields: frame_seq, timestamp_ns, width, height, rgba, done,
+optional public audio {audio_pcm, audio_rate, audio_channels,
+audio_sample_width} when a stimulus sound was queued, optional drain-once
+outcome {scalar, evidence_digests, receipt_id, frame_seq, timestamp_ns}.
+
+Audio is the played waveform, not a letter ID. No cell IDs, modality
+names, phase names, scores, label counts, or sequences. Actions are
+opaque integer port indices.
 
 Shared-memory export (NW_SHM) is a one-way framebuffer dump, not a
 complete cross-process control protocol (no seqlock, no action channel,
@@ -38,12 +44,19 @@ import struct
 import sys
 import time
 
-os.environ.setdefault('NW_HEADLESS', '1')
+def _env_flag(name, default='1'):
+    return os.environ.get(name, default).lower() in ('1', 'true', 'yes', 'on')
+
+
+_HEADLESS = _env_flag('NW_HEADLESS', '1')
+if _HEADLESS:
+    os.environ.setdefault('NW_HEADLESS', '1')
 
 import pyglet
-# Force silent audio *before* brainworkshop loads pyglet.media, so
-# headless training never starts OpenAL.
-pyglet.options['audio'] = ('silent',)
+# Headless training uses the silent driver so OpenAL is never started.
+# Visible gym sessions (NW_HEADLESS=0) keep the normal audio path.
+if _HEADLESS:
+    pyglet.options['audio'] = ('silent',)
 if sys.platform.startswith('linux'):
     try:
         pyglet.options['headless'] = True
@@ -354,19 +367,27 @@ class _TestProbe(object):
 
 class NeuralWorkshopEnv(object):
     def __init__(self, seed=None, shm_name=None, diagnostics=False,
-                 game_mode=None, num_trials=None):
+                 game_mode=None, num_trials=None, n_back=None,
+                 grid_size=None, active_cells=None, mute_music=True,
+                 mute_applause=True, visible=False):
         if diagnostics and os.environ.get('NW_DIAGNOSTICS') != '1':
             raise RuntimeError(
                 'diagnostic construction rejected (set NW_DIAGNOSTICS=1)')
         self._game_mode = game_mode
         self._num_trials = num_trials
+        self._n_back = n_back
+        self._grid_size = grid_size
+        self._active_cells = active_cells
+        self._mute_music = bool(mute_music)
+        self._mute_applause = bool(mute_applause)
+        self._visible = bool(visible)
         bw.mode.step_mode = True
         try:
             pyglet.clock.unschedule(bw.update)
         except Exception:
             pass
         try:
-            bw.window.set_visible(False)
+            bw.window.set_visible(bool(self._visible))
         except Exception:
             pass
         bw.cfg.SHOW_FEEDBACK = True
@@ -393,6 +414,7 @@ class NeuralWorkshopEnv(object):
         self._delivered = set()
         self._cached_outcome = None
         self._receipt_ledger = {}
+        self._public_audio = None
         self.reset(0 if seed is None else seed)
 
     @property
@@ -414,6 +436,10 @@ class NeuralWorkshopEnv(object):
         bw.cfg.SHOW_FEEDBACK = True
         bw.cfg.ANIMATE_SQUARES = False
         bw.mode.hide_text = False
+        try:
+            bw.window.set_visible(bool(self._visible))
+        except Exception:
+            pass
         self._apply_session_config()
         bw.new_session()
         bw.mode.step_mode = True
@@ -535,11 +561,35 @@ class NeuralWorkshopEnv(object):
         self._export.close()
 
     def _apply_session_config(self):
+        if self._grid_size is not None:
+            size = int(self._grid_size)
+            if size < 1:
+                raise ValueError('grid_size must be positive')
+            bw.cfg.GRID_SIZE = size
+        if self._active_cells is not None:
+            cells = int(self._active_cells)
+            if cells < 0:
+                raise ValueError('active_cells cannot be negative')
+            bw.cfg.ACTIVE_POSITION_CELLS = cells
+            bw.cfg.POSITION_CELL_COUNT = cells
+        if self._mute_music:
+            bw.cfg.USE_MUSIC = False
+        if self._mute_applause:
+            bw.cfg.USE_APPLAUSE = False
+        bw.cfg.MANUAL = True
+        bw.mode.manual = True
         if self._game_mode is not None:
             bw.mode.mode = int(self._game_mode)
             bw.cfg.GAME_MODE = int(self._game_mode)
+        if self._n_back is not None:
+            depth = int(self._n_back)
+            if depth < 1:
+                raise ValueError('n_back must be positive')
+            bw.mode.back = depth
         if self._num_trials is not None:
             n = int(self._num_trials)
+            if n < 1:
+                raise ValueError('num_trials must be positive')
             bw.mode.num_trials = n
             bw.mode.num_trials_factor = 0
             bw.mode.num_trials_total = n
@@ -592,7 +642,30 @@ class NeuralWorkshopEnv(object):
         }
         if self._cached_outcome is not None:
             obs['outcome'] = self._cached_outcome
+        if self._public_audio is not None:
+            obs.update(self._public_audio)
         return obs
+
+    def _snapshot_public_audio(self):
+        """Publish the last queued stimulus waveform. Never a letter index."""
+
+        captures = getattr(bw, 'audio_capture', None)
+        if not captures:
+            self._public_audio = None
+            return
+        rec = captures[-1]
+        pcm = rec.get('pcm') or b''
+        if not pcm:
+            self._public_audio = None
+            return
+        fmt = rec.get('audio_format')
+        bits = int(getattr(fmt, 'sample_size', 16) or 16)
+        self._public_audio = {
+            'audio_pcm': pcm,
+            'audio_rate': int(getattr(fmt, 'sample_rate', 0) or 0),
+            'audio_channels': int(getattr(fmt, 'channels', 0) or 1),
+            'audio_sample_width': max(bits // 8, 1),
+        }
 
     def _emit_once(self, key, event):
         if key in self._delivered:
@@ -619,6 +692,10 @@ class NeuralWorkshopEnv(object):
         self.accounting.significant_frames += 1
         self._export.write(self._seq, self._timestamp_ns, w, h, rgba, False)
         self._cached_outcome = None
+        if phase == 'stimulus':
+            self._snapshot_public_audio()
+        else:
+            self._public_audio = None
         if phase == 'feedback':
             rid = (self._trial_receipt or {}).get('receipt_id')
             if rid is not None and rid in self._receipt_ledger:
@@ -667,11 +744,16 @@ class DiagnosticEnv(NeuralWorkshopEnv):
     """Test/debug wrapper. Production ``NeuralWorkshopEnv`` has no probe."""
 
     def __init__(self, seed=None, shm_name=None, game_mode=None,
-                 num_trials=None):
+                 num_trials=None, n_back=None, grid_size=None,
+                 active_cells=None, mute_music=True, mute_applause=True,
+                 visible=False):
         os.environ['NW_DIAGNOSTICS'] = '1'
         super(DiagnosticEnv, self).__init__(
             seed=seed, shm_name=shm_name, diagnostics=True,
-            game_mode=game_mode, num_trials=num_trials)
+            game_mode=game_mode, num_trials=num_trials, n_back=n_back,
+            grid_size=grid_size, active_cells=active_cells,
+            mute_music=mute_music, mute_applause=mute_applause,
+            visible=visible)
         self.probe = _TestProbe()
 
 
